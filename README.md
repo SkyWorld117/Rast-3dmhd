@@ -1,5 +1,11 @@
 # Rast-3DMHD
 
+> This project is a test project for the automated porting and accleration of
+legacy codebases using LLM + Kez. While LLMs have sufficient knowledge to understand
+building and testing of legacy codebases, a mature toolchain can greately reduce
+its struggles in utilizing third-party libraries, and provide a more robust and
+reproducible build environment. Details see the report section of the project.
+
 GPU-accelerated 3D magnetohydrodynamics. This is a C++/CUDA rewrite of the
 Rast 3DMHD Fortran code: the MPI process grid is **parsed at runtime instead
 of hardcoded**, and the compute sweeps run either on the CPU or, in a CUDA
@@ -220,3 +226,16 @@ A Kez recipe (`database/rast-3dmhd/latest.yaml`) wraps the make build, exposes
 `BACKEND`, `CXX`, `NVCC`, `NVCC_ARCH`, `NVCCFLAGS`, `CXXFLAGS`, `DUMPMODE`,
 `WITH_TESTS`/`GTEST_PREFIX` as user-configurable options, and installs via
 `make install PREFIX=...`.
+
+---
+
+## Report
+
+We notice the following behavior of the LLM-assisted porting and acceleration process:
+
+- The model we used (DeepSeek V4 Flash 0731) is able to understand the codebase and finish the two-stage porting process (Fortran -> C++ -> CUDA) with minimal human intervention, but this is in general not the interesting part of this project as it mostly depends on the model's knowledge.
+- The model does understand how Kez manages the build environment and dependencies, and can actively
+  leverage it to reduce the burden of manual dependency management.
+- However, the model is not able to utilize Kez during the porting process itself. We designed local source support to help developers to build and test the codebase through Kez. Even though this is available during porting, the model does not use it, and instead prefers building manually in a local environment. One likely needs to provide additional guidance to the model to make it aware of the local source support, and how to use it.
+
+Overall the results are very positive and surprising. This project was used as an application during SC23 SCC, and the model was able to port and accelerate the codebase with CUDA and NCCL support which is even bit-identical to the original Fortran code. With some minor relaxation and compiler flags, the runtime can be reduced to around 3 minutes for a 1000-step run on 8 NVIDIA H200 NVL GPUs, which is a significant speedup compared to the original Fortran code.
