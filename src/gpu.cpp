@@ -114,6 +114,7 @@ namespace r3d {
         if (e != cudaSuccess) {                                                            \
             fprintf(stderr, "rast-3dmhd: CUDA error %s at %s:%d\n", cudaGetErrorString(e), \
                     __FILE__, __LINE__);                                                   \
+            fflush(stderr);   /* never lose the message before exit() */                    \
             exit(EXIT_FAILURE);                                                            \
         }                                                                                  \
     } while (0)

@@ -28,6 +28,17 @@
 
 namespace r3d {
 
+    // Print a message, flush it, then abort MPI.  Flushing matters: when
+    // stderr is a buffered pipe (as under `mpirun ... 2>&1 | grep`), a
+    // message left in the buffer vanishes if another rank's abort kills the
+    // job first - which is exactly how the CPU-only "--backend gpu" guard
+    // used to lose its diagnostic.
+    [[noreturn]] void fatal(const std::string& msg) {
+        fprintf(stderr, "%s\n", msg.c_str());
+        fflush(stderr);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     // Dump the full state in the golden gstate format (see read_gstate.py).
     // tag chooses the file set; iter suffixes the filename.
     void write_gstate(const Params& p, const Derived& d, const Topology& t, const SimState& s,
@@ -35,10 +46,7 @@ namespace r3d {
         char fname[256];
         snprintf(fname, sizeof(fname), "gstate.%s.%03d.%04d", tag, t.mype, iter);
         FILE* f = fopen(fname, "wb");
-        if (!f) {
-            fprintf(stderr, "rast-3dmhd: cannot open dump '%s'\n", fname);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+        if (!f) fatal("rast-3dmhd: cannot open dump '" + std::string(fname) + "'");
         auto w        = [&](const void* v, size_t n) { fwrite(v, 1, n, f); };
         int32_t magic = 1129928788, nf = 27, n1 = 14;
         w(&magic, 4);
@@ -141,8 +149,7 @@ int main(int argc, char** argv) {
         r3d::static_ic(MPI_COMM_WORLD, p, d, t, s);
         s.timi = 0.0;
     } else {
-        fprintf(stderr, "rast-3dmhd: restart (NSTART!=0) is not yet ported\n");
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        r3d::fatal("rast-3dmhd: restart (NSTART!=0) is not yet ported");
     }
     r3d::communicate(MPI_COMM_WORLD, p, t, s);
 
@@ -271,9 +278,8 @@ int main(int argc, char** argv) {
         // Fail loudly instead of silently running the CPU path on a CPU-only
         // build (the GPU scripts guard against this, but be safe anyway).
         if (mype == 0)
-            fprintf(stderr,
-                    "rast-3dmhd: --backend gpu requested but this binary was built without CUDA "
-                    "(rebuild with: make BACKEND=gpu)\n");
+            r3d::fatal("rast-3dmhd: --backend gpu requested but this binary was built without CUDA "
+                  "(rebuild with: make BACKEND=gpu)");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 #endif

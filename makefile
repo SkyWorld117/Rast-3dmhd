@@ -46,8 +46,12 @@
 BACKEND   = cpu
 BUILD    ?= build
 BINDIR    = bin
-OBJDIR    = $(BUILD)/obj
-LIBDIR    = $(BUILD)/lib
+# Objects (and the archive) are segregated per backend: switching BACKEND
+# without 'make clean' must never reuse stale objects from the other backend
+# (a stale CPU-built main.o carries the "--backend gpu" guard and once leaked
+# into a GPU build, tripping it at runtime).
+OBJDIR   := $(BUILD)/obj-$(BACKEND)
+LIBDIR   := $(BUILD)/lib-$(BACKEND)
 
 PREFIX   ?= $(CURDIR)/prefix
 DESTDIR  ?=
@@ -205,12 +209,18 @@ test_gpu:
 endif
 
 # ------------------------------------------------------------------------------
-# Install.
+# Install.  This stages the artifacts already produced by the build (bin/,
+# the backend-specific static library, headers) rather than rebuilding - so a
+# package manager's install stage can run 'make install' with the default
+# (cpu) variables and still install the GPU binary the 'make BACKEND=gpu' step
+# produced.  Build first: 'make' or 'make BACKEND=gpu'.
 # ------------------------------------------------------------------------------
-install: $(BINDIR)/3dmhd $(LIBDIR)/librast3dmhd.a
+install:
+	[ -x $(BINDIR)/3dmhd ] || { echo "error: build first: make (or make BACKEND=gpu)"; exit 1; }
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
 	install -m 0755 $(BINDIR)/3dmhd      $(DESTDIR)$(PREFIX)/bin/3dmhd
-	install -m 0644 $(LIBDIR)/librast3dmhd.a $(DESTDIR)$(PREFIX)/lib/librast3dmhd.a
+	@ARCH=$$(ls -t $(BUILD)/lib-*/librast3dmhd.a 2>/dev/null | head -1); \
+	[ -n "$$ARCH" ] && install -m 0644 "$$ARCH" $(DESTDIR)$(PREFIX)/lib/librast3dmhd.a || true
 	install -m 0644 include/*.hpp        $(DESTDIR)$(PREFIX)/include/
 
 uninstall:
@@ -219,6 +229,6 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/include/*.hpp
 
 clean:
-	rm -rf $(OBJDIR) $(BINDIR) $(LIBDIR) $(TEST_BINS)
+	rm -rf $(BUILD) $(BINDIR) $(TEST_BINS)
 
 .PHONY: all lib test test_multi test_gpu install uninstall clean
