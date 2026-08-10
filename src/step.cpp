@@ -12,6 +12,17 @@
 #include "communicate.hpp"
 #include "fluxes.hpp"
 
+// Parallel sweeps with OpenMP (CPU backend only).  Every sweep writes only its
+// own cell (independent stencil), and the per-step reductions below are exact
+// min/max, so threading preserves the golden bit-exact result.  Compiled out
+// when _OPENMP is undefined (the GPU backend builds these files as host code
+// without -fopenmp).
+#ifdef _OPENMP
+#define R3D_OMP_FOR _Pragma("omp parallel for schedule(static)")
+#else
+#define R3D_OMP_FOR
+#endif
+
 namespace r3d {
 
     namespace {
@@ -26,6 +37,7 @@ namespace r3d {
         // Copy current physical state into the Z* save buffers (interior only).
         void save_state(const Params& p, const Derived& d, SimState& s) {
             Int3 r = interior(p, d);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i) {
@@ -40,22 +52,27 @@ namespace r3d {
         // One RK substep accumulator update: X = Z + COEF*F for the 5 primaries.
         void update_prim(const Params& p, const Derived& d, double coef, SimState& s) {
             Int3 r = interior(p, d);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.ru.at(i, j, k) = s.zru.at(i, j, k) + coef * s.fu.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.rv.at(i, j, k) = s.zrv.at(i, j, k) + coef * s.fv.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.rw.at(i, j, k) = s.zrw.at(i, j, k) + coef * s.fw.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.ro.at(i, j, k) = s.zro.at(i, j, k) + coef * s.fr.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
@@ -65,22 +82,27 @@ namespace r3d {
         // X = X + ZETA*F  (used between substeps: Z = U + zeta*dt*F)
         void mix_state(const Params& p, const Derived& d, double coef, SimState& s) {
             Int3 r = interior(p, d);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.zru.at(i, j, k) = s.ru.at(i, j, k) + coef * s.fu.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.zrv.at(i, j, k) = s.rv.at(i, j, k) + coef * s.fv.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.zrw.at(i, j, k) = s.rw.at(i, j, k) + coef * s.fw.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
                         s.zro.at(i, j, k) = s.ro.at(i, j, k) + coef * s.fr.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
@@ -100,6 +122,7 @@ namespace r3d {
         s.umach     = 0.0;
         double rmin = 1.0e9;
         double vmax = 0.0;
+        R3D_OMP_FOR
         for (int k = r.k1; k <= r.k2; ++k)
             for (int j = r.j1; j <= r.j2; ++j)
                 for (int i = r.i1; i <= r.i2; ++i)
@@ -107,14 +130,19 @@ namespace r3d {
                         (s.ru.at(i, j, k) * s.ru.at(i, j, k) + s.rv.at(i, j, k) * s.rv.at(i, j, k) +
                          s.rw.at(i, j, k) * s.rw.at(i, j, k)) *
                         (1.0 / s.ro.at(i, j, k)) * (1.0 / s.ro.at(i, j, k));
+        double umach_tmp = 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(max : umach_tmp)
+#endif
         for (int k = r.k1; k <= r.k2; ++k)
             for (int j = r.j1; j <= r.j2; ++j)
                 for (int i = r.i1; i <= r.i2; ++i)
-                    s.umach = std::max(s.umach, ogamma * s.uu.at(i, j, k) / s.tt.at(i, j, k));
-        s.umach = std::sqrt(s.umach);
+                    umach_tmp = std::max(umach_tmp, ogamma * s.uu.at(i, j, k) / s.tt.at(i, j, k));
+        s.umach = std::sqrt(umach_tmp);
 
         // Fast-mode speed (with optional magnetic contribution).
         if (p.lmag) {
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i) {
@@ -127,6 +155,7 @@ namespace r3d {
                             2.0 * std::sqrt(s.uu.at(i, j, k) * (p.gamma * s.tt.at(i, j, k) + b2));
                     }
         } else {
+            R3D_OMP_FOR
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
                     for (int i = r.i1; i <= r.i2; ++i)
@@ -134,13 +163,18 @@ namespace r3d {
                             s.uu.at(i, j, k) + p.gamma * s.tt.at(i, j, k) +
                             2.0 * std::sqrt(s.uu.at(i, j, k) * p.gamma * s.tt.at(i, j, k));
         }
+        double vmax_tmp = 0.0, rmin_tmp = 1.0e9;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(max : vmax_tmp) reduction(min : rmin_tmp)
+#endif
         for (int k = r.k1; k <= r.k2; ++k)
             for (int j = r.j1; j <= r.j2; ++j)
                 for (int i = r.i1; i <= r.i2; ++i) {
-                    vmax = std::max(vmax, s.uu.at(i, j, k));
-                    rmin = std::min(rmin, s.ro.at(i, j, k));
+                    vmax_tmp = std::max(vmax_tmp, s.uu.at(i, j, k));
+                    rmin_tmp = std::min(rmin_tmp, s.ro.at(i, j, k));
                 }
-        vmax = std::sqrt(vmax);
+        vmax = std::sqrt(vmax_tmp);
+        (void) rmin_tmp;
 
         double umach_all;
         MPI_Allreduce(&s.umach, &umach_all, 1, MPI_DOUBLE, MPI_MAX, comm);
@@ -149,6 +183,7 @@ namespace r3d {
         // ---- pointwise minimum timestep (ISW=1 branch) ------------------------
         // DD is the smallest grid spacing (pointwise), WW1..3 carry the per-cell
         // advective / diffusive / viscous limits.
+        R3D_OMP_FOR
         for (int k = r.k1; k <= r.k2; ++k)
             for (int j = r.j1; j <= r.j2; ++j)
                 for (int i = r.i1; i <= r.i2; ++i) {
@@ -160,22 +195,31 @@ namespace r3d {
                     if (p.lmag) s.vv.at(i, j, k) = 0.5 * dd * dd * p.rm;
                 }
         double wmin[4], wout[4];
-        wmin[0] = wmin[1] = wmin[2] = 1e300;
-        int mincnt                  = 3;
+        int mincnt = 3;
+        double w0 = 1e300, w1 = 1e300, w2 = 1e300;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(min : w0, w1, w2)
+#endif
         for (int k = r.k1; k <= r.k2; ++k)
             for (int j = r.j1; j <= r.j2; ++j)
                 for (int i = r.i1; i <= r.i2; ++i) {
-                    wmin[0] = std::min(wmin[0], s.ww1.at(i, j, k));
-                    wmin[1] = std::min(wmin[1], s.ww2.at(i, j, k));
-                    wmin[2] = std::min(wmin[2], s.ww3.at(i, j, k));
+                    w0 = std::min(w0, s.ww1.at(i, j, k));
+                    w1 = std::min(w1, s.ww2.at(i, j, k));
+                    w2 = std::min(w2, s.ww3.at(i, j, k));
                 }
+        wmin[0] = w0;
+        wmin[1] = w1;
+        wmin[2] = w2;
         if (p.lmag) {
-            wmin[3] = 1e300;
-            mincnt  = 4;
+            double w3 = 1e300;
+            mincnt    = 4;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(min : w3)
+#endif
             for (int k = r.k1; k <= r.k2; ++k)
                 for (int j = r.j1; j <= r.j2; ++j)
-                    for (int i = r.i1; i <= r.i2; ++i)
-                        wmin[3] = std::min(wmin[3], s.vv.at(i, j, k));
+                    for (int i = r.i1; i <= r.i2; ++i) w3 = std::min(w3, s.vv.at(i, j, k));
+            wmin[3] = w3;
         }
         MPI_Allreduce(wmin, wout, mincnt, MPI_DOUBLE, MPI_MIN, comm);
         if (p.lmag) {

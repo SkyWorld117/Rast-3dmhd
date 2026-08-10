@@ -47,6 +47,10 @@ NPEZ=$((NP / NPEY))
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
+# One OpenMP thread per rank CPU (this script pins 1 core per rank; for a
+# hybrid run give each rank more cores via --cpus-per-task and it scales up).
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+
 echo "== rast-3dmhd CPU job: ranks=$NP grid 504x${NPY}x${NPZ} npey=$NPEY npez=$NPEZ steps=$NTOTAL =="
 T0=$(date +%s)
 

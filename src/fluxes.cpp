@@ -14,6 +14,17 @@
 
 #include "communicate.hpp"
 
+// Parallel sweeps with OpenMP (CPU backend only).  Every sweep below is a
+// stencil writing only its own cell, and there are no reductions in this file,
+// so threading the k axis preserves the golden bit-exact result.  Compiled out
+// when _OPENMP is undefined (the GPU backend builds these files as host code
+// without -fopenmp, where a thread pool would be wasted per rank).
+#ifdef _OPENMP
+#define R3D_OMP_FOR _Pragma("omp parallel for schedule(static)")
+#else
+#define R3D_OMP_FOR
+#endif
+
 namespace r3d {
 
     // Optional advanced features of the original (LREM stratification / flux
@@ -73,6 +84,7 @@ namespace r3d {
         // ===================================================================
         // FR from the divergence of the momentum.
         // ===================================================================
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             for (int j = j1; j <= j2; ++j) {
                 double tmpy = hy * s.dyydy[j];
@@ -84,6 +96,7 @@ namespace r3d {
         }
         // WW1 = dRW/dz (with one-sided 2nd-order stencils at the two z edges of
         // the domain, handled per rank).
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             double tmpz = hz * s.dzzdz[k];
             for (int j = j1; j <= j2; ++j)
@@ -102,6 +115,7 @@ namespace r3d {
                 for (int i = i1; i <= i2; ++i)
                     WW1.at(i, j, k2) = (RW.at(i, j, k2 - 2) - 4.0 * RW.at(i, j, k2 - 1)) * tmpz;
         }
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i) FR.at(i, j, k) -= WW1.at(i, j, k);
@@ -109,11 +123,13 @@ namespace r3d {
         // ===================================================================
         // Buoyancy, pressure, 1/rho and velocities.
         // ===================================================================
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i) FW.at(i, j, k) = p.grav * RO.at(i, j, k);
 
         // WW1 = P = RHO*T ; RO = 1/RHO over the FULL local array (ghosts too).
+        R3D_OMP_FOR
         for (int k = 0; k < nz; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = 0; i < nx; ++i) {
@@ -122,6 +138,7 @@ namespace r3d {
                 }
 
         // Pressure gradients.
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             double tmpz = hz * s.dzzdz[k];
             for (int j = j1; j <= j2; ++j) {
@@ -135,12 +152,15 @@ namespace r3d {
         }
 
         // Velocities = momentum * 1/rho (full array).
+        R3D_OMP_FOR
         for (int k = 0; k < nz; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = 0; i < nx; ++i) UU.at(i, j, k) = RU.at(i, j, k) * RO.at(i, j, k);
+        R3D_OMP_FOR
         for (int k = 0; k < nz; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = 0; i < nx; ++i) VV.at(i, j, k) = RV.at(i, j, k) * RO.at(i, j, k);
+        R3D_OMP_FOR
         for (int k = 0; k < nz; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = 0; i < nx; ++i) WW.at(i, j, k) = RW.at(i, j, k) * RO.at(i, j, k);
@@ -148,6 +168,7 @@ namespace r3d {
         // ===================================================================
         // Advection of momenta.
         // ===================================================================
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             double tmpz = hz * s.dzzdz[k];
             for (int j = j1; j <= j2; ++j) {
@@ -165,6 +186,7 @@ namespace r3d {
                 }
             }
         }
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             double tmpz = hz * s.dzzdz[k];
             for (int j = j1; j <= j2; ++j) {
@@ -182,6 +204,7 @@ namespace r3d {
                 }
             }
         }
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             double tmpz = hz * s.dzzdz[k];
             for (int j = j1; j <= j2; ++j) {
@@ -203,6 +226,7 @@ namespace r3d {
         // ===================================================================
         // Internal energy: advection then second-order diffusion of T.
         // ===================================================================
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             double tmpz = hz * s.dzzdz[k];
             for (int j = j1; j <= j2; ++j) {
@@ -221,6 +245,7 @@ namespace r3d {
         // Thermal diffusion of T (non-LREM branch).
         {
             const double tmp = d.ocv / d.repr;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k) {
                 const double tmpz1 = hz * s.d2zzdz2[k];
                 const double tmpz2 = h2z * s.dzzdz[k] * s.dzzdz[k];
@@ -253,6 +278,7 @@ namespace r3d {
         // ===================================================================
         // Viscous terms on the momenta.
         // ===================================================================
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k) {
             const double tmpz1 = hz * s.d2zzdz2[k];
             const double tmpz2 = h2z * s.dzzdz[k] * s.dzzdz[k];
@@ -298,14 +324,17 @@ namespace r3d {
         // dUU/dx etc.  Note the Fortran loops for WW1 (=dUU/dx), WW2 (=dVV/dx)
         // run over ALL j (J=1,NY) while WW3 (=dWW/dx) runs over interior j.
         // ===================================================================
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW1.at(i, j, k) = (UU.at(i + 1, j, k) - UU.at(i - 1, j, k)) * hx * s.dxxdx[i];
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW2.at(i, j, k) = (VV.at(i + 1, j, k) - VV.at(i - 1, j, k)) * hx * s.dxxdx[i];
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i)
@@ -313,6 +342,7 @@ namespace r3d {
 
         {
             const double tmp = d.ocv * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -320,6 +350,7 @@ namespace r3d {
                                            WW2.at(i, j, k) * WW2.at(i, j, k) +
                                            WW3.at(i, j, k) * WW3.at(i, j, k)) *
                                           RO.at(i, j, k) * tmp;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -329,11 +360,13 @@ namespace r3d {
         // Cross terms coupling the horizontal shear to FU/FV.
         {
             const double tmp = c13 * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
                         FU.at(i, j, k) +=
                             tmp * (WW2.at(i, j + 1, k) - WW2.at(i, j - 1, k)) * hy * s.dyydy[j];
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -342,12 +375,14 @@ namespace r3d {
         }
 
         // dUU/dy, dVV/dy: dissipation terms from horizontal shear.
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW1.at(i, j, k) = (UU.at(i, j + 1, k) - UU.at(i, j - 1, k)) * hy * s.dyydy[j];
         {
             const double tmp = d.ocv * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -355,28 +390,33 @@ namespace r3d {
                                            2.0 * WW1.at(i, j, k) * WW2.at(i, j, k)) *
                                           RO.at(i, j, k) * tmp;
         }
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW2.at(i, j, k) = (VV.at(i, j + 1, k) - VV.at(i, j - 1, k)) * hy * s.dyydy[j];
         {
             const double tmp = c43 * d.ocv * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
                         FT.at(i, j, k) += WW2.at(i, j, k) * WW2.at(i, j, k) * RO.at(i, j, k) * tmp;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
                         FT.at(i, j, k) -= d.ocv * WW2.at(i, j, k) * TT.at(i, j, k);
         }
         // Recompute WW1 = dUU/dx (used by the vertical dissipation below).
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW1.at(i, j, k) = (UU.at(i + 1, j, k) - UU.at(i - 1, j, k)) * hx * s.dxxdx[i];
 
         // dWW/dz over the FULL i,j array.
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = 0; i < nx; ++i)
@@ -384,6 +424,7 @@ namespace r3d {
 
         {
             const double tmp = c43 * d.ocv * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -392,6 +433,7 @@ namespace r3d {
                              WW1.at(i, j, k) * WW2.at(i, j, k) -
                              WW2.at(i, j, k) * WW3.at(i, j, k)) *
                             RO.at(i, j, k) * tmp;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -400,11 +442,13 @@ namespace r3d {
 
         {
             const double tmp = c13 * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
                         FU.at(i, j, k) +=
                             tmp * (WW3.at(i + 1, j, k) - WW3.at(i - 1, j, k)) * hx * s.dxxdx[i];
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -413,22 +457,26 @@ namespace r3d {
         }
 
         // dUU/dz (I=1..NX all i), dVV/dz (J=1..NY all j).
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = 0; i < nx; ++i)
                     WW1.at(i, j, k) = (UU.at(i, j, k + 1) - UU.at(i, j, k - 1)) * hz * s.dzzdz[k];
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = 0; j < ny; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW2.at(i, j, k) = (VV.at(i, j, k + 1) - VV.at(i, j, k - 1)) * hz * s.dzzdz[k];
 
         // dWW/dy (interior) then the final dissipation sum.
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW3.at(i, j, k) = (WW.at(i, j + 1, k) - WW.at(i, j - 1, k)) * hy * s.dyydy[j];
         {
             const double tmp = d.ocv * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -441,6 +489,7 @@ namespace r3d {
 
         {
             const double tmp = c13 * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -449,12 +498,14 @@ namespace r3d {
                                    (WW2.at(i, j + 1, k) - WW2.at(i, j - 1, k)) * hy * s.dyydy[j]);
         }
 
+        R3D_OMP_FOR
         for (int k = k1; k <= k2; ++k)
             for (int j = j1; j <= j2; ++j)
                 for (int i = i1; i <= i2; ++i)
                     WW3.at(i, j, k) = (WW.at(i + 1, j, k) - WW.at(i - 1, j, k)) * hx * s.dxxdx[i];
         {
             const double tmp = d.ocv * ore;
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
@@ -466,13 +517,16 @@ namespace r3d {
         // Rotation (Coriolis) terms.
         // ===================================================================
         if (p.lrot) {
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i) FU.at(i, j, k) += d.omz * RV.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i)
                         FV.at(i, j, k) += -d.omz * RU.at(i, j, k) + d.omx * RW.at(i, j, k);
+            R3D_OMP_FOR
             for (int k = k1; k <= k2; ++k)
                 for (int j = j1; j <= j2; ++j)
                     for (int i = i1; i <= i2; ++i) FW.at(i, j, k) += -d.omx * RV.at(i, j, k);

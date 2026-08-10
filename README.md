@@ -38,6 +38,9 @@ make clean
 | `DUMPMODE` | `periodic` / `final` / `none` | `periodic` | Compile-time checkpoint policy, see [Output](#output) |
 | `WITH_TESTS` | `0` / `1` | `0` | Build the GoogleTest suite (`make WITH_TESTS=1 test...`); requires gtest |
 | `GTEST_PREFIX` | path | Kez system cellar | Header/lib location for the tests (derives `GTEST_INC` / `GTEST_LIB`) |
+| `OPENMP` | `0` / `1` | `1` | Thread the CPU-backend sweeps with OpenMP (hybrid MPI+OpenMP); thread count from `OMP_NUM_THREADS`/affinity. The sweeps write only their own cell and the reductions are exact min/max, so the golden bit-exact result is preserved at any thread count. Only the CPU backend links `-fopenmp`; the GPU backend compiles the same files as nvcc host code, where the pragmas are compiled out |
+| `USE_NCCL` | `0` / `1` | `0` | GPU halo exchange via device-side NCCL (`ncclAllGather` exchange + `ncclAllReduce` for dt) instead of host-staged MPI; needs an NCCL (`NCCL_HOME`, or `NCCL_INC`/`NCCL_LIBS`). GPU-only |
+| `NCCL_HOME` | path | empty | NCCL prefix (`-I`/`-L`/rpath derived); an empty value looks NCCL up on the default search path |
 
 ### Tests
 
@@ -156,7 +159,9 @@ sbatch --gres=gpu:8   scripts/run_gpu.sbatch
 The scripts validate the process-grid/geometry decomposition, set up the Kez
 OpenMPI environment, filter benign OpenMPI/UCX startup noise, pin one GPU per
 rank (`CUDA_VISIBLE_DEVICES=$OMPI_COMM_WORLD_LOCAL_RANK`), and report overall
-wall time and step rate.
+wall time and step rate.  `run_cpu.sbatch` pins one core per rank (`1`
+OpenMP thread each); for a hybrid run give each rank more cores
+(`--cpus-per-task=8`) and `OMP_NUM_THREADS` scales with it.
 
 ---
 

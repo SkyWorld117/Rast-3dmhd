@@ -35,6 +35,8 @@
 #   USE_NCCL    0|1  use the device-side NCCL exchange (default 0 = host-staged
 #                    MPI; GPU only).  Empty counts as 0.
 #   NCCL_HOME   NCCL prefix used only when USE_NCCL=1 (default empty)
+#   OPENMP      0|1  thread the CPU-backend sweeps (default 1; CPU only - the
+#                    GPU backend builds them as host code without -fopenmp)
 #   LDFLAGS     extra linker flags               (default empty)
 #   LDLIBS      extra libraries to link          (default -lm)
 #   DUMPMODE    periodic | final | none          (compile-time gstate policy)
@@ -63,6 +65,13 @@ ifneq ($(strip $(USE_NCCL)),)
     $(error USE_NCCL must be empty, 0 or 1)
   endif
 endif
+
+# OpenMP for the CPU-backend sweeps.  The per-cell stencils are independent and
+# the reductions are exact min/max, so -fopenmp preserves the golden bit-exact
+# result; the thread count comes from OMP_NUM_THREADS/affinity at run time.
+# Only the CPU backend links libgomp - the GPU backend compiles the same files
+# with nvcc without -fopenmp (the pragmas are compiled out via _OPENMP).
+OPENMP ?= 1
 BUILD    ?= build
 BINDIR    = bin
 # Objects (and the archive) are segregated per backend AND halo backend
@@ -143,12 +152,19 @@ ifeq ($(BACKEND),cpu)
   ifneq ($(USE_NCCL),)
     $(error USE_NCCL requires BACKEND=gpu)
   endif
+  ifeq ($(OPENMP),1)
+    OMPFLAG := -fopenmp
+  else ifneq ($(filter 0,$(OPENMP)),)
+    OMPFLAG :=
+  else ifneq ($(strip $(OPENMP)),)
+    $(error OPENMP must be 0 or 1)
+  endif
   LIB_SRCS := $(filter-out src/gpu.cpp,$(LIB_SRCS))
   LIB_OBJS := $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
   GPU_OBJS :=
   CC       := $(CXX)
-  COMPILE  := $(CC) $(CXXFLAGS) -MMD -MP -Iinclude $(DUMP_FLAG)
-  LINK     := $(CC) $(CXXFLAGS) $(LDFLAGS)
+  COMPILE  := $(CC) $(CXXFLAGS) $(OMPFLAG) -MMD -MP -Iinclude $(DUMP_FLAG)
+  LINK     := $(CC) $(CXXFLAGS) $(OMPFLAG) $(LDFLAGS)
   LINK_OBJS := $(LIBDIR)/librast3dmhd.a
 
 else ifeq ($(BACKEND),gpu)
