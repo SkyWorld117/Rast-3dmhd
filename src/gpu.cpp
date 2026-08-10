@@ -349,11 +349,11 @@ namespace r3d {
             // GPU-direct halo exchange via NCCL is the planned follow-up.)
             const int nx = g.nx, ny = g.ny, nz = g.nz;
             const int iyh = p.iy / 2, ilaph = p.ilap / 2;
-            const long vcount = (long) nx * ny * ilaph;
-            const long ycount = (long) nx * iyh * nz;
+            const long vcount   = (long) nx * ny * ilaph;
+            const long ycount   = (long) nx * iyh * nz;
             static double* hbuf = nullptr;  // pinned host staging (send + recv)
-            static long hcap     = 0;
-            const long hneed     = std::max(vcount, ycount);
+            static long hcap    = 0;
+            const long hneed    = std::max(vcount, ycount);
             if (hcap < hneed) {
                 if (hbuf) cudaFreeHost(hbuf);
                 CUDA_CHECK(cudaMallocHost((void**) &hbuf, (size_t) hneed * sizeof(double)));
@@ -363,12 +363,12 @@ namespace r3d {
             // copies make every ordering between hbuf and the default-stream
             // kernels deterministic by construction (no async-use-after-reuse).
             auto copy_to_dev = [&](double* dst, long cnt) {
-                CUDA_CHECK(cudaMemcpy(dst, hbuf, (size_t) cnt * sizeof(double),
-                                      cudaMemcpyHostToDevice));
+                CUDA_CHECK(
+                    cudaMemcpy(dst, hbuf, (size_t) cnt * sizeof(double), cudaMemcpyHostToDevice));
             };
             auto copy_to_host = [&](const double* src, long cnt) {
-                CUDA_CHECK(cudaMemcpy(hbuf, src, (size_t) cnt * sizeof(double),
-                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(
+                    cudaMemcpy(hbuf, src, (size_t) cnt * sizeof(double), cudaMemcpyDeviceToHost));
             };
             const double* vbot = f + (long) (nz - p.ilap) * nx * ny;  // send (bottom)
             double* vghost     = f + (long) (nz - ilaph) * nx * ny;   // recv (upper)
@@ -522,9 +522,8 @@ namespace r3d {
     // ---------------------------------------------------------------------------
     // step_gpu
     // ---------------------------------------------------------------------------
-    void step_gpu(int nstages, MPI_Comm comm, const Params& p, const Derived& d,
-                  const Topology& t, GpuSim& g,
-                  SimState& sc) {
+    void step_gpu(int nstages, MPI_Comm comm, const Params& p, const Derived& d, const Topology& t,
+                  GpuSim& g, SimState& sc) {
         K q;
         q.nx    = g.nx;
         q.ny    = g.ny;
@@ -623,8 +622,8 @@ namespace r3d {
                          kThreads>>>(q, g.fr, g.ww1);
             // Snapshot the pristine rho before the in-place inversion, then run
             // the full-array prep and the interior force as separate kernels.
-            CUDA_CHECK(cudaMemcpy(g.rho0, g.ro, (size_t) n * sizeof(double),
-                                  cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(
+                cudaMemcpy(g.rho0, g.ro, (size_t) n * sizeof(double), cudaMemcpyDeviceToDevice));
             k_force_prep<<<ceil_div(n, kThreads), kThreads>>>(q, g.rho0, g.tt, g.ro, g.ww1);
             check();
             k_force<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
@@ -689,17 +688,15 @@ namespace r3d {
             k_w1_dy<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
                                kThreads),
                       kThreads>>>(q, g.uu, g.ww1, g.dyydy);
-            k_ft_heat2a<<<ceil_div(
-                             (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
-                             kThreads),
-                         kThreads>>>(q, g.ro, g.ft, g.ww1, g.ww2);
+            k_ft_heat2a<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                                   kThreads),
+                          kThreads>>>(q, g.ro, g.ft, g.ww1, g.ww2);
             k_w2_dy<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
                                kThreads),
                       kThreads>>>(q, g.vv, g.ww2, g.dyydy);
-            k_ft_heat2b<<<ceil_div(
-                             (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
-                             kThreads),
-                         kThreads>>>(q, g.ro, g.tt, g.ft, g.ww2);
+            k_ft_heat2b<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                                   kThreads),
+                          kThreads>>>(q, g.ro, g.tt, g.ft, g.ww2);
             check();
             k_w1_dx_again<<<ceil_div(
                                 (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
@@ -811,8 +808,8 @@ namespace r3d {
         sc.timt = sc.timi + sc.timc;
     }
 
-    void step_gpu(MPI_Comm comm, const Params& p, const Derived& d,
-                  const Topology& t, GpuSim& g, SimState& scalars) {
+    void step_gpu(MPI_Comm comm, const Params& p, const Derived& d, const Topology& t, GpuSim& g,
+                  SimState& scalars) {
         step_gpu(3, comm, p, d, t, g, scalars);
     }
 

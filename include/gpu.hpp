@@ -27,7 +27,7 @@ namespace r3d {
         double *wyy   = nullptr, *dyydy, *d2yydy2, *ddy;
         double *zee   = nullptr, *dzzdz, *d2zzdz2, *ddz;
         double *rkapa = nullptr, *dkapa;
-        double *rho0 = nullptr; // pristine rho snapshot
+        double* rho0  = nullptr;  // pristine rho snapshot
     };
 
     // Allocate device buffers sized from d, upload all host state, register the
@@ -45,7 +45,7 @@ namespace r3d {
 
     // Advance by exactly nstages Runge-Kutta substages (1..3); used by tests to
     // compare intermediate RK states against the golden reference.
-    void step_gpu(int nstages, MPI_Comm comm, const Params& p, const Derived& d,
-                  const Topology& t, GpuSim& g, SimState& scalars);
+    void step_gpu(int nstages, MPI_Comm comm, const Params& p, const Derived& d, const Topology& t,
+                  GpuSim& g, SimState& scalars);
 
 }  // namespace r3d

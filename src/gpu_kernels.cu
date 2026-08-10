@@ -75,7 +75,7 @@ namespace r3d {
     }
     // FW=GRAV*RO (interior); full-array WW1=RO*TT and RO=1/RO; pressure grads.
     __global__ void k_force_prep(const K q, const double* ro0, const double* tt, double* ro,
-                                double* ww1) {
+                                 double* ww1) {
         long full = (long) q.nx * q.ny * q.nz;
         for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < full;
              t += (long) blockDim.x * gridDim.x) {
