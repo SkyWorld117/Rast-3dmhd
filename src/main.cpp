@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,10 @@
 #include "static_ic.hpp"
 #include "step.hpp"
 #include "topology.hpp"
+
+#ifdef R3D_HAVE_GPU
+#include "gpu.hpp"
+#endif
 
 namespace r3d {
 
@@ -165,18 +170,131 @@ int main(int argc, char** argv) {
                 npe, t.npey, t.npez, d.nx, d.ny, d.nz, p.ntotal, dt0, p.ntotal);
     }
 
-    r3d::write_gstate(p, d, t, s, "start", 0);
+    // ------------------------------------------------------------------
+    // Compile-time dump mode (set via -DR3D_DUMP_MODE=N in the makefile):
+    //   0 = none     - no gstate dump files at all (progress is still logged)
+    //   1 = final    - the initial gstate.start plus only the final step
+    //   2 = periodic - NSTEP0-cadence dumps plus the final step (default)
+    // Each dump is ~NX*NY*NZ*27*8 B per rank (e.g. ~118 GB per checkpoint at
+    // the default 504x504x2048 grid), so the more restrictive modes keep long
+    // runs from filling the filesystem.
+    // ------------------------------------------------------------------
+#ifndef R3D_DUMP_MODE
+#define R3D_DUMP_MODE 2
+#endif
+#if R3D_DUMP_MODE < 0 || R3D_DUMP_MODE > 2
+#error "R3D_DUMP_MODE must be 0 (none), 1 (final) or 2 (periodic)"
+#endif
 
-    for (int nk = 1; nk <= p.ntotal; ++nk) {
-        r3d::step(MPI_COMM_WORLD, p, d, t, s);
-        if (s.dt < 1.0e-8) {
-            if (mype == 0) fprintf(stderr, "rast-3dmhd: timestep underflow at NIT=%d\n", s.nit);
-            break;
+    // The initial-condition dump (gstate.start.NIT0) is written in every mode
+    // except "none".
+#if R3D_DUMP_MODE != 0
+    r3d::write_gstate(p, d, t, s, "start", 0);
+#endif
+
+    // Wall-clock timing for the progress log (CLOCK_MONOTONIC: immune to NTP).
+    struct timespec wstart;
+    clock_gettime(CLOCK_MONOTONIC, &wstart);
+    auto wall_since = [&]() {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return (now.tv_sec - wstart.tv_sec) + 1e-9 * (now.tv_nsec - wstart.tv_nsec);
+    };
+
+    // Whether this step writes a gstate dump.
+    auto should_dump = [&](int nit, int nk) {
+#if R3D_DUMP_MODE == 0
+        (void) nit;
+        return false;
+#elif R3D_DUMP_MODE == 1
+        (void) nit;
+        return nk == p.ntotal;
+#else
+        return (nit % p.nstep0 == 0) || nk == p.ntotal;
+#endif
+    };
+    // Whether this step prints the NIT/timing progress line.  Every mode logs
+    // at the NSTEP0 cadence (and at the end) so even a dump-less run stays
+    // observable; in the dumping modes the progress line accompanies each dump.
+    auto should_log = [&](int nit, int nk) {
+#if R3D_DUMP_MODE == 0
+        return (nit % p.nstep0 == 0) || nk == p.ntotal;
+#else
+        return should_dump(nit, nk);
+#endif
+    };
+
+#ifdef R3D_HAVE_GPU
+    if (p.backend == r3d::Params::Backend::kGpu) {
+        // GPU-resident time loop: the full state stays on the device; only the
+        // few per-step reduction scalars and the periodic dumps cross the bus.
+        cudaSetDevice(p.gpu_id);  // pick this rank's GPU (honours CUDA_VISIBLE_DEVICES)
+        r3d::GpuSim gsim;
+        r3d::gpu_alloc(gsim, d);
+        r3d::gpu_upload(gsim, s);
+        r3d::SimState sc(d);  // scalar mirror: dt/nit/timc live here on the GPU path
+        sc.tb    = s.tb;
+        sc.timi  = s.timi;
+        sc.timc  = s.timc;
+        sc.timt  = s.timt;
+        sc.nit   = s.nit;
+        sc.dt    = s.dt;
+        sc.umach = s.umach;
+        for (int nk = 1; nk <= p.ntotal; ++nk) {
+            r3d::step_gpu(MPI_COMM_WORLD, p, d, t, gsim, sc);
+            if (sc.dt < 1.0e-8) {
+                if (mype == 0)
+                    fprintf(stderr, "rast-3dmhd: timestep underflow at NIT=%d\n", sc.nit);
+                break;
+            }
+            if (should_log(sc.nit, nk)) {
+                if (should_dump(sc.nit, nk)) {
+                    r3d::gpu_download(s, gsim);
+                    s.nit  = sc.nit;
+                    s.dt   = sc.dt;
+                    s.timc = sc.timc;
+                    s.timt = sc.timt;
+                    r3d::write_gstate(p, d, t, s, "step", s.nit);
+                }
+                if (mype == 0) {
+                    double wall = wall_since();
+                    fprintf(stderr, "NIT %d  DT %g  TIMC %g  UMACH %g  WALL %.1fs (%.2fs/step)\n",
+                            sc.nit, sc.dt, sc.timc, sc.umach, wall, wall / sc.nit);
+                }
+            }
         }
-        if (s.nit % p.nstep0 == 0 || nk == p.ntotal) {
-            r3d::write_gstate(p, d, t, s, "step", s.nit);
-            if (mype == 0)
-                fprintf(stderr, "NIT %d  DT %g  TIMC %g  UMACH %g\n", s.nit, s.dt, s.timc, s.umach);
+        r3d::gpu_download(s, gsim);
+        gpu_free(gsim);
+    } else
+#else
+    if (p.backend == r3d::Params::Backend::kGpu) {
+        // Fail loudly instead of silently running the CPU path on a CPU-only
+        // build (the GPU scripts guard against this, but be safe anyway).
+        if (mype == 0)
+            fprintf(stderr,
+                    "rast-3dmhd: --backend gpu requested but this binary was built without CUDA "
+                    "(rebuild with: make BACKEND=gpu)\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+#endif
+    {
+        // CPU-resident time loop.
+        for (int nk = 1; nk <= p.ntotal; ++nk) {
+            r3d::step(MPI_COMM_WORLD, p, d, t, s);
+            if (s.dt < 1.0e-8) {
+                if (mype == 0) fprintf(stderr, "rast-3dmhd: timestep underflow at NIT=%d\n", s.nit);
+                break;
+            }
+            if (should_log(s.nit, nk)) {
+                if (should_dump(s.nit, nk)) {
+                    r3d::write_gstate(p, d, t, s, "step", s.nit);
+                }
+                if (mype == 0) {
+                    double wall = wall_since();
+                    fprintf(stderr, "NIT %d  DT %g  TIMC %g  UMACH %g  WALL %.1fs (%.2fs/step)\n",
+                            s.nit, s.dt, s.timc, s.umach, wall, wall / s.nit);
+                }
+            }
         }
     }
 

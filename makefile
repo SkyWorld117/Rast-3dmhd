@@ -22,6 +22,25 @@ CXX      = mpicxx   # MPI code: use the MPI wrapper by default
 CXXFLAGS  = -O2 -g -std=c++17 -Wall -Wextra -Iinclude
 LDLIBS   ?= -lm
 
+# Compile-time dump mode: 'make DUMPMODE={periodic,final,none}' (default
+# periodic).  Each gstate dump is ~NX*NY*NZ*27*8 B per rank (~118 GB per
+# checkpoint at the default 504x504x2048 grid), so restrict it for long runs:
+#   periodic  - dumps every NSTEP0 steps plus the final step (plus gstate.start)
+#   final     - only the final step's dump (plus gstate.start)
+#   none      - no gstate dump files at all (per-step progress is still logged)
+# 'make DUMPFINAL=1' is kept as an alias for DUMPMODE=final (an explicit
+# DUMPMODE on the command line wins over the alias).
+DUMPMODE ?= $(if $(DUMPFINAL),final,periodic)
+ifeq ($(DUMPMODE),periodic)
+  CXXFLAGS += -DR3D_DUMP_MODE=2
+else ifeq ($(DUMPMODE),final)
+  CXXFLAGS += -DR3D_DUMP_MODE=1
+else ifeq ($(DUMPMODE),none)
+  CXXFLAGS += -DR3D_DUMP_MODE=0
+else
+  $(error DUMPMODE must be one of: periodic, final, none)
+endif
+
 MPICXX   = mpicxx
 LINKXX   = $(CXX)
 NVCC    = $(or $(CUDA_HOME)/bin/nvcc,/usr/local/cuda/bin/nvcc)
@@ -53,9 +72,8 @@ ifeq ($(BACKEND),gpu)
   # compiler (plain g++, no -ffast-math) does not - disable contraction so the
   # GPU arithmetic matches the CPU/golden rounding exactly.
   CXXFLAGS += -fmad=false
-  # Bit-exact port: nvcc fuses a*b+c into FMA by default, which the host
-  # compiler (plain g++, no -ffast-math) does not - disable contraction so the
-  # GPU arithmetic matches the CPU/golden rounding exactly.
+  # The driver only dispatches to the GPU step loop when built with CUDA.
+  CXXFLAGS += -DR3D_HAVE_GPU
 
   LINKXX := $(NVCC)
   MPI_LIBS := $(shell echo '$(MPI_LIBS)' | sed 's/-Wl,\([^ ]*\)/-Xlinker \1/g')

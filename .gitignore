@@ -17,3 +17,9 @@ gstate.*
 golden/build/
 golden/ref/
 __pycache__/
+
+# Log files
+*.log
+*.out
+*.err
+logs/
