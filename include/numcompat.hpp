@@ -14,12 +14,10 @@
 
 namespace r3d {
 
-inline double f4(double x) { return (double)(float)x; }
+    inline double f4(double x) { return (double) (float) x; }
 
-// All-operands-single integer-to-real conversions (FLOAT(j) * orx pattern):
-// 1.0E00/FLOAT(n)  == f4(1.0f / (float)n)
-inline double f4_over_int(double num, long den) {
-  return f4((float)num / (float)den);
-}
+    // All-operands-single integer-to-real conversions (FLOAT(j) * orx pattern):
+    // 1.0E00/FLOAT(n)  == f4(1.0f / (float)n)
+    inline double f4_over_int(double num, long den) { return f4((float) num / (float) den); }
 
 }  // namespace r3d

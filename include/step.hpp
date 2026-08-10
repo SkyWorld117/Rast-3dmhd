@@ -14,13 +14,12 @@
 
 namespace r3d {
 
-// Advance the state by one step; updates s.dt, s.timc, s.timt, s.nit.
-void step(MPI_Comm comm, const Params& p, const Derived& d, const Topology& t,
-          SimState& s);
+    // Advance the state by one step; updates s.dt, s.timc, s.timt, s.nit.
+    void step(MPI_Comm comm, const Params& p, const Derived& d, const Topology& t, SimState& s);
 
-// Advance by exactly nstages Runge-Kutta substages (1..3); used by tests to
-// compare intermediate RK states against the golden reference.
-void step(int nstages, MPI_Comm comm, const Params& p, const Derived& d,
-          const Topology& t, SimState& s);
+    // Advance by exactly nstages Runge-Kutta substages (1..3); used by tests to
+    // compare intermediate RK states against the golden reference.
+    void step(int nstages, MPI_Comm comm, const Params& p, const Derived& d, const Topology& t,
+              SimState& s);
 
 }  // namespace r3d

@@ -12,6 +12,6 @@
 
 namespace r3d {
 
-void bcon(const Params& p, const Derived& d, const Topology& t, SimState& s);
+    void bcon(const Params& p, const Derived& d, const Topology& t, SimState& s);
 
 }  // namespace r3d

@@ -15,9 +15,9 @@
 
 namespace r3d {
 
-// Build the initial state (overwrites RU,RV,RW,TT,RO and B fields if LMAG).
-// Assumes the grid metrics and RKAPA/DKAPA are already filled.
-void static_ic(MPI_Comm comm, const Params& p, const Derived& d,
-               const Topology& t, SimState& s);
+    // Build the initial state (overwrites RU,RV,RW,TT,RO and B fields if LMAG).
+    // Assumes the grid metrics and RKAPA/DKAPA are already filled.
+    void static_ic(MPI_Comm comm, const Params& p, const Derived& d, const Topology& t,
+                   SimState& s);
 
 }  // namespace r3d

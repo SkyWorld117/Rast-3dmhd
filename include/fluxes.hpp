@@ -14,12 +14,11 @@
 
 namespace r3d {
 
-// Compute FU,FV,FW,FR,FT constraints (and WW1..WW3 as B fluxes when LMAG)
-// from the current physical state RO,RV,RW,TT,RO(,B fields).  Overwrites
-// RO with 1/RO and UU,VV,WW with velocities (like the Fortran), and uses
-// WW1..WW3 as scratch.
-void fluxes(const Params& p, const Derived& d, const Topology& t,
-            const double rkapa[] /*nz*/, const double dkapa[] /*nz*/,
-            SimState& s);
+    // Compute FU,FV,FW,FR,FT constraints (and WW1..WW3 as B fluxes when LMAG)
+    // from the current physical state RO,RV,RW,TT,RO(,B fields).  Overwrites
+    // RO with 1/RO and UU,VV,WW with velocities (like the Fortran), and uses
+    // WW1..WW3 as scratch.
+    void fluxes(const Params& p, const Derived& d, const Topology& t, const double rkapa[] /*nz*/,
+                const double dkapa[] /*nz*/, SimState& s);
 
 }  // namespace r3d

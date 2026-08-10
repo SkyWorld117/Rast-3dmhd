@@ -10,14 +10,14 @@
 
 namespace r3d {
 
-struct Ran2State {
-  int idum = 0;       // negative -> seed on next call, then updated in place
-  int iiy = 0;
-  int iir[97] = {0};
-};
+    struct Ran2State {
+        int idum    = 0;  // negative -> seed on next call, then updated in place
+        int iiy     = 0;
+        int iir[97] = {0};
+    };
 
-// Draw the next deviate in (0,1).  On the first call (when idum < 0) the
-// generator is seeded from idum.  Returns a double in (0,1).
-double ran2(Ran2State& s);
+    // Draw the next deviate in (0,1).  On the first call (when idum < 0) the
+    // generator is seeded from idum.  Returns a double in (0,1).
+    double ran2(Ran2State& s);
 
 }  // namespace r3d

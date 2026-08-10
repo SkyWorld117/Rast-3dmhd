@@ -17,17 +17,17 @@
 
 namespace r3d {
 
-// Exchange halos of the 5 primary fields (and the B fields when lmag).
-void communicate(MPI_Comm comm, const Params& p, const Topology& t, SimState& s);
+    // Exchange halos of the 5 primary fields (and the B fields when lmag).
+    void communicate(MPI_Comm comm, const Params& p, const Topology& t, SimState& s);
 
-// Exchange halos of one field (COMM_MPI).
-void comm_mpi(MPI_Comm comm, const Params& p, const Topology& t, Field& f);
+    // Exchange halos of one field (COMM_MPI).
+    void comm_mpi(MPI_Comm comm, const Params& p, const Topology& t, Field& f);
 
-// Horizontal mean of a 3D field (HORIZONTAL_MEAN): varm(k) = average over
-// the interior x/y at each z, then reduced across y ranks.  For NGRID=0 the
-// sum is over the interior cells; the spline path for NGRID>0 is currently
-// disabled in the reference (it would terminate).
-void horizontal_mean(MPI_Comm comm, const Params& p, const Topology& t,
-                     const SimState& s, const Field& f, double* varm);
+    // Horizontal mean of a 3D field (HORIZONTAL_MEAN): varm(k) = average over
+    // the interior x/y at each z, then reduced across y ranks.  For NGRID=0 the
+    // sum is over the interior cells; the spline path for NGRID>0 is currently
+    // disabled in the reference (it would terminate).
+    void horizontal_mean(MPI_Comm comm, const Params& p, const Topology& t, const SimState& s,
+                         const Field& f, double* varm);
 
 }  // namespace r3d
