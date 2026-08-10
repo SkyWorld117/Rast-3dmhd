@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
         // build (the GPU scripts guard against this, but be safe anyway).
         if (mype == 0)
             r3d::fatal("rast-3dmhd: --backend gpu requested but this binary was built without CUDA "
-                  "(rebuild with: make BACKEND=gpu)");
+                       "(rebuild with: make BACKEND=gpu)");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 #endif
