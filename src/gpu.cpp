@@ -30,8 +30,9 @@ namespace r3d {
                          const double*, const double*, const double*);
     __global__ void k_fr_w1b(const K, const double*, double*, const double*, int);
     __global__ void k_fr_subw1(const K, double*, const double*);
-    __global__ void k_force(const K, double, const double*, const double*, double*, double*,
-                            double*, double*, double*, const double*, const double*, const double*);
+    __global__ void k_force_prep(const K, const double*, const double*, double*, double*);
+    __global__ void k_force(const K, double, const double*, double*, double*, double*,
+                            const double*, const double*, const double*, const double*);
     __global__ void k_vel(const K, const double*, const double*, const double*, const double*,
                           double*, double*, double*);
     __global__ void k_adv(const K, int, const double*, const double*, const double*, const double*,
@@ -58,10 +59,10 @@ namespace r3d {
                                const double*, const double*);
     __global__ void k_cross_fufv(const K, double*, double*, const double*, const double*,
                                  const double*);
-    __global__ void k_w1_w2_dy(const K, const double*, const double*, double*, double*,
-                               const double*);
-    __global__ void k_ft_heat2(const K, const double*, const double*, double*, const double*,
-                               const double*);
+    __global__ void k_w1_dy(const K, const double*, double*, const double*);
+    __global__ void k_w2_dy(const K, const double*, double*, const double*);
+    __global__ void k_ft_heat2a(const K, const double*, double*, const double*, const double*);
+    __global__ void k_ft_heat2b(const K, const double*, const double*, double*, const double*);
     __global__ void k_w1_dx_again(const K, const double*, double*, const double*);
     __global__ void k_w3_dz_full(const K, const double*, double*, const double*);
     __global__ void k_ft_heat3a(const K, const double*, const double*, double*, const double*,
@@ -178,6 +179,7 @@ namespace r3d {
         alloc(&g.ddz, d.nz);
         alloc(&g.rkapa, d.nz);
         alloc(&g.dkapa, d.nz);
+        alloc(&g.rho0, n);  // pristine rho snapshot
     }
 
     void gpu_free(GpuSim& g) {
@@ -227,6 +229,7 @@ namespace r3d {
         FREE(g.ddz);
         FREE(g.rkapa);
         FREE(g.dkapa);
+        FREE(g.rho0);
 #undef FREE
     }
 
@@ -280,6 +283,7 @@ namespace r3d {
         cp(g.ddz, s.ddz.data(), g.nz);
         cp(g.rkapa, s.rkapa.data(), g.nz);
         cp(g.dkapa, s.dkapa.data(), g.nz);
+        cp(g.rho0, s.ro.data(), n);  // initial pristine rho
     }
 
     void gpu_download(SimState& s, GpuSim& g) {
@@ -334,33 +338,70 @@ namespace r3d {
 
         void comm_field_gpu(MPI_Comm comm, const Params& p, const Topology& t, GpuSim& g,
                             double* f) {
-            // GPU-direct halo exchange: contiguous vertical slabs pass straight to
-            // CUDA-aware MPI on device pointers; strided y/x slabs are packed on the
-            // device through small staging buffers.
+            // Host-staged halo exchange.  Every MPI transfer touches only pinned
+            // HOST memory (ordinary MPI semantics, reliable on all transports);
+            // device<->host transfers are cudaMemcpyAsync on the default stream,
+            // so ordering with the pack/unpack kernels on that stream is
+            // deterministic by construction.  (Passing device pointers to CUDA-aware
+            // MPI instead proved unreliable here: UCX performs its copies on an
+            // internal stream that a blocking Recv return and even a default-stream
+            // sync do not join, so consumer kernels could read a previous message.
+            // GPU-direct halo exchange via NCCL is the planned follow-up.)
             const int nx = g.nx, ny = g.ny, nz = g.nz;
             const int iyh = p.iy / 2, ilaph = p.ilap / 2;
             const long vcount = (long) nx * ny * ilaph;
+            const long ycount = (long) nx * iyh * nz;
+            static double* hbuf = nullptr;  // pinned host staging (send + recv)
+            static long hcap     = 0;
+            const long hneed     = std::max(vcount, ycount);
+            if (hcap < hneed) {
+                if (hbuf) cudaFreeHost(hbuf);
+                CUDA_CHECK(cudaMallocHost((void**) &hbuf, (size_t) hneed * sizeof(double)));
+                hcap = hneed;
+            }
+            // Blocking copies: the transfers are tiny (halo slabs) and blocking
+            // copies make every ordering between hbuf and the default-stream
+            // kernels deterministic by construction (no async-use-after-reuse).
+            auto copy_to_dev = [&](double* dst, long cnt) {
+                CUDA_CHECK(cudaMemcpy(dst, hbuf, (size_t) cnt * sizeof(double),
+                                      cudaMemcpyHostToDevice));
+            };
+            auto copy_to_host = [&](const double* src, long cnt) {
+                CUDA_CHECK(cudaMemcpy(hbuf, src, (size_t) cnt * sizeof(double),
+                                      cudaMemcpyDeviceToHost));
+            };
+            const double* vbot = f + (long) (nz - p.ilap) * nx * ny;  // send (bottom)
+            double* vghost     = f + (long) (nz - ilaph) * nx * ny;   // recv (upper)
+            // Vertical z exchange (host-staged on BOTH sides - the slab is
+            // written by default-stream kernels; a direct device send could be
+            // consumed by the transport's internal stream before those kernels
+            // complete, the same ordering hazard we hit on receives).
             if (t.npez > 1) {
                 const int tag1 = 100, tag2 = 200;
                 if (t.mypez == 0) {
-                    MPI_Send(f + (long) (nz - p.ilap) * nx * ny, vcount, MPI_DOUBLE,
-                             t.mype + t.npey, tag1, comm);
-                    MPI_Recv(f + (long) (nz - ilaph) * nx * ny, vcount, MPI_DOUBLE, t.mype + t.npey,
-                             tag2, comm, MPI_STATUS_IGNORE);
+                    copy_to_host(vbot, vcount);
+                    MPI_Send(hbuf, vcount, MPI_DOUBLE, t.mype + t.npey, tag1, comm);
+                    MPI_Recv(hbuf, vcount, MPI_DOUBLE, t.mype + t.npey, tag2, comm,
+                             MPI_STATUS_IGNORE);
+                    copy_to_dev(vghost, vcount);
                 } else if (t.mypez == t.npez - 1) {
-                    MPI_Recv(f, vcount, MPI_DOUBLE, t.mype - t.npey, tag1, comm, MPI_STATUS_IGNORE);
-                    MPI_Send(f + (long) ilaph * nx * ny, vcount, MPI_DOUBLE, t.mype - t.npey, tag2,
-                             comm);
+                    MPI_Recv(hbuf, vcount, MPI_DOUBLE, t.mype - t.npey, tag1, comm,
+                             MPI_STATUS_IGNORE);
+                    copy_to_dev(f, vcount);
+                    copy_to_host(f + (long) ilaph * nx * ny, vcount);
+                    MPI_Send(hbuf, vcount, MPI_DOUBLE, t.mype - t.npey, tag2, comm);
                 } else {
-                    MPI_Sendrecv(f + (long) (nz - p.ilap) * nx * ny, vcount, MPI_DOUBLE,
-                                 t.mype + t.npey, tag1, f, vcount, MPI_DOUBLE, t.mype - t.npey,
-                                 tag1, comm, MPI_STATUS_IGNORE);
-                    MPI_Sendrecv(f + (long) ilaph * nx * ny, vcount, MPI_DOUBLE, t.mype - t.npey,
-                                 tag2, f + (long) (nz - ilaph) * nx * ny, vcount, MPI_DOUBLE,
-                                 t.mype + t.npey, tag2, comm, MPI_STATUS_IGNORE);
+                    copy_to_host(vbot, vcount);
+                    MPI_Sendrecv(hbuf, vcount, MPI_DOUBLE, t.mype + t.npey, tag1, hbuf, vcount,
+                                 MPI_DOUBLE, t.mype - t.npey, tag1, comm, MPI_STATUS_IGNORE);
+                    copy_to_dev(f, vcount);
+                    copy_to_host(f + (long) ilaph * nx * ny, vcount);
+                    MPI_Sendrecv(hbuf, vcount, MPI_DOUBLE, t.mype - t.npey, tag2, hbuf, vcount,
+                                 MPI_DOUBLE, t.mype + t.npey, tag2, comm, MPI_STATUS_IGNORE);
+                    copy_to_dev(vghost, vcount);
                 }
             }
-            const long ycount    = (long) nx * iyh * nz;
+            // device staging buffers for the strided y/x exchanges
             static double* ysend = nullptr;
             static double* yrecv = nullptr;
             static long ycap     = 0;
@@ -379,34 +420,42 @@ namespace r3d {
                     k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, ny - p.iy,
                                                                        iyh, nz);
                     check();
-                    MPI_Send(ysend, ycount, MPI_DOUBLE, t.mype + 1, tag3, comm);
-                    MPI_Recv(yrecv, ycount, MPI_DOUBLE, t.mype + 1, tag4, comm, MPI_STATUS_IGNORE);
+                    copy_to_host(ysend, ycount);
+                    MPI_Send(hbuf, ycount, MPI_DOUBLE, t.mype + 1, tag3, comm);
+                    MPI_Recv(hbuf, ycount, MPI_DOUBLE, t.mype + 1, tag4, comm, MPI_STATUS_IGNORE);
+                    copy_to_dev(yrecv, ycount);
                     k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(f, yrecv, nx, ny, ny - iyh,
                                                                          iyh, nz);
                     check();
                 } else if (t.mypey == t.npey - 1) {
-                    MPI_Recv(yrecv, ycount, MPI_DOUBLE, t.mype - 1, tag3, comm, MPI_STATUS_IGNORE);
+                    MPI_Recv(hbuf, ycount, MPI_DOUBLE, t.mype - 1, tag3, comm, MPI_STATUS_IGNORE);
+                    copy_to_dev(yrecv, ycount);
                     k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(f, yrecv, nx, ny, 0, iyh,
                                                                          nz);
                     check();
                     k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, iyh, iyh,
                                                                        nz);
                     check();
-                    MPI_Send(ysend, ycount, MPI_DOUBLE, t.mype - 1, tag4, comm);
+                    copy_to_host(ysend, ycount);
+                    MPI_Send(hbuf, ycount, MPI_DOUBLE, t.mype - 1, tag4, comm);
                 } else {
                     k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, ny - p.iy,
                                                                        iyh, nz);
                     check();
-                    MPI_Sendrecv(ysend, ycount, MPI_DOUBLE, t.mype + 1, tag3, yrecv, ycount,
+                    copy_to_host(ysend, ycount);
+                    MPI_Sendrecv(hbuf, ycount, MPI_DOUBLE, t.mype + 1, tag3, hbuf, ycount,
                                  MPI_DOUBLE, t.mype - 1, tag3, comm, MPI_STATUS_IGNORE);
+                    copy_to_dev(yrecv, ycount);
                     k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(f, yrecv, nx, ny, 0, iyh,
                                                                          nz);
                     check();
                     k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, iyh, iyh,
                                                                        nz);
                     check();
-                    MPI_Sendrecv(ysend, ycount, MPI_DOUBLE, t.mype - 1, tag4, yrecv, ycount,
+                    copy_to_host(ysend, ycount);
+                    MPI_Sendrecv(hbuf, ycount, MPI_DOUBLE, t.mype - 1, tag4, hbuf, ycount,
                                  MPI_DOUBLE, t.mype + 1, tag4, comm, MPI_STATUS_IGNORE);
+                    copy_to_dev(yrecv, ycount);
                     k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(f, yrecv, nx, ny, ny - iyh,
                                                                          iyh, nz);
                     check();
@@ -415,22 +464,26 @@ namespace r3d {
                     k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, iyh, iyh,
                                                                        nz);
                     check();
-                    MPI_Send(ysend, ycount, MPI_DOUBLE, t.mype + t.npey - 1, tag5, comm);
-                    MPI_Recv(yrecv, ycount, MPI_DOUBLE, t.mype + t.npey - 1, tag6, comm,
+                    copy_to_host(ysend, ycount);
+                    MPI_Send(hbuf, ycount, MPI_DOUBLE, t.mype + t.npey - 1, tag5, comm);
+                    MPI_Recv(hbuf, ycount, MPI_DOUBLE, t.mype + t.npey - 1, tag6, comm,
                              MPI_STATUS_IGNORE);
+                    copy_to_dev(yrecv, ycount);
                     k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(f, yrecv, nx, ny, 0, iyh,
                                                                          nz);
                     check();
                 } else if (t.mypey == t.npey - 1) {
-                    MPI_Recv(yrecv, ycount, MPI_DOUBLE, t.mype - t.npey + 1, tag5, comm,
+                    MPI_Recv(hbuf, ycount, MPI_DOUBLE, t.mype - t.npey + 1, tag5, comm,
                              MPI_STATUS_IGNORE);
+                    copy_to_dev(yrecv, ycount);
                     k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(f, yrecv, nx, ny, ny - iyh,
                                                                          iyh, nz);
                     check();
                     k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, ny - p.iy,
                                                                        iyh, nz);
                     check();
-                    MPI_Send(ysend, ycount, MPI_DOUBLE, t.mype - t.npey + 1, tag6, comm);
+                    copy_to_host(ysend, ycount);
+                    MPI_Send(hbuf, ycount, MPI_DOUBLE, t.mype - t.npey + 1, tag6, comm);
                 }
             } else {
                 k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, ny - p.iy, iyh,
@@ -469,7 +522,8 @@ namespace r3d {
     // ---------------------------------------------------------------------------
     // step_gpu
     // ---------------------------------------------------------------------------
-    void step_gpu(MPI_Comm comm, const Params& p, const Derived& d, const Topology& t, GpuSim& g,
+    void step_gpu(int nstages, MPI_Comm comm, const Params& p, const Derived& d,
+                  const Topology& t, GpuSim& g,
                   SimState& sc) {
         K q;
         q.nx    = g.nx;
@@ -567,10 +621,16 @@ namespace r3d {
             k_fr_subw1<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
                                   kThreads),
                          kThreads>>>(q, g.fr, g.ww1);
+            // Snapshot the pristine rho before the in-place inversion, then run
+            // the full-array prep and the interior force as separate kernels.
+            CUDA_CHECK(cudaMemcpy(g.rho0, g.ro, (size_t) n * sizeof(double),
+                                  cudaMemcpyDeviceToDevice));
+            k_force_prep<<<ceil_div(n, kThreads), kThreads>>>(q, g.rho0, g.tt, g.ro, g.ww1);
+            check();
             k_force<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
                                kThreads),
-                      kThreads>>>(q, p.grav, g.ro, g.tt, g.ro, g.fu, g.fv, g.fw, g.ww1, g.dxxdx,
-                                  g.dyydy, g.dzzdz);
+                      kThreads>>>(q, p.grav, g.rho0, g.fu, g.fv, g.fw, g.ww1, g.dxxdx, g.dyydy,
+                                  g.dzzdz);
             k_vel<<<ceil_div(n, kThreads), kThreads>>>(q, g.ru, g.rv, g.rw, g.ro, g.uu, g.vv, g.ww);
             k_adv<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
                              kThreads),
@@ -624,12 +684,22 @@ namespace r3d {
                                (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
                                kThreads),
                            kThreads>>>(q, g.fu, g.fv, g.ww1, g.ww2, g.dyydy);
-            k_w1_w2_dy<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
-                                  kThreads),
-                         kThreads>>>(q, g.uu, g.vv, g.ww1, g.ww2, g.dyydy);
-            k_ft_heat2<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
-                                  kThreads),
-                         kThreads>>>(q, g.ro, g.tt, g.ft, g.ww1, g.ww2);
+            // Fortran order: WW1=dU/dy -> FT+=(W1^2+2 W1 W2)RO*TMP using the
+            // still-valid WW2=dV/dx -> THEN WW2=dV/dy -> FT+=W2^2..., FT-=ocv W2 T.
+            k_w1_dy<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                               kThreads),
+                      kThreads>>>(q, g.uu, g.ww1, g.dyydy);
+            k_ft_heat2a<<<ceil_div(
+                             (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                             kThreads),
+                         kThreads>>>(q, g.ro, g.ft, g.ww1, g.ww2);
+            k_w2_dy<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                               kThreads),
+                      kThreads>>>(q, g.vv, g.ww2, g.dyydy);
+            k_ft_heat2b<<<ceil_div(
+                             (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                             kThreads),
+                         kThreads>>>(q, g.ro, g.tt, g.ft, g.ww2);
             check();
             k_w1_dx_again<<<ceil_div(
                                 (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
@@ -719,26 +789,31 @@ namespace r3d {
             }
         };
 
-        flux_gpu();
-        substep_gpu(d.gam1 * sc.dt);
-        bcon_gpu();
-        comm_gpu();
-
-        mix_gpu(d.zeta1 * sc.dt);
-        flux_gpu();
-        substep_gpu(d.gam2 * sc.dt);
-        bcon_gpu();
-        comm_gpu();
-
-        mix_gpu(d.zeta2 * sc.dt);
-        flux_gpu();
-        substep_gpu(d.gam3 * sc.dt);
-        bcon_gpu();
-        comm_gpu();
+        for (int st = 0; st < nstages; ++st) {
+            if (st == 0) {
+                flux_gpu();
+                substep_gpu(d.gam1 * sc.dt);
+            } else if (st == 1) {
+                mix_gpu(d.zeta1 * sc.dt);
+                flux_gpu();
+                substep_gpu(d.gam2 * sc.dt);
+            } else {
+                mix_gpu(d.zeta2 * sc.dt);
+                flux_gpu();
+                substep_gpu(d.gam3 * sc.dt);
+            }
+            bcon_gpu();
+            comm_gpu();
+        }
 
         sc.nit += 1;
         sc.timc += sc.dt;
         sc.timt = sc.timi + sc.timc;
+    }
+
+    void step_gpu(MPI_Comm comm, const Params& p, const Derived& d,
+                  const Topology& t, GpuSim& g, SimState& scalars) {
+        step_gpu(3, comm, p, d, t, g, scalars);
     }
 
 }  // namespace r3d

@@ -49,6 +49,14 @@ ifeq ($(BACKEND),gpu)
   CXX := $(NVCC)
   CXXFLAGS := $(filter-out -Wall -Wextra,$(CXXFLAGS))
   CXXFLAGS += -x cu -rdc=true --cudart=static -arch=$(NVCC_ARCH) $(MPI_CFLAGS)
+  # Bit-exact port: nvcc fuses a*b+c into FMA by default, which the host
+  # compiler (plain g++, no -ffast-math) does not - disable contraction so the
+  # GPU arithmetic matches the CPU/golden rounding exactly.
+  CXXFLAGS += -fmad=false
+  # Bit-exact port: nvcc fuses a*b+c into FMA by default, which the host
+  # compiler (plain g++, no -ffast-math) does not - disable contraction so the
+  # GPU arithmetic matches the CPU/golden rounding exactly.
+
   LINKXX := $(NVCC)
   MPI_LIBS := $(shell echo '$(MPI_LIBS)' | sed 's/-Wl,\([^ ]*\)/-Xlinker \1/g')
   LINKFLAGS += -rdc=true -arch=$(NVCC_ARCH) --cudart=static $(MPI_LIBS) -lcudart

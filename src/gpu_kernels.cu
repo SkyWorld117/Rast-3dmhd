@@ -74,9 +74,8 @@ namespace r3d {
         }
     }
     // FW=GRAV*RO (interior); full-array WW1=RO*TT and RO=1/RO; pressure grads.
-    __global__ void k_force(const K q, double grav, const double* ro0, const double* tt, double* ro,
-                            double* fu, double* fv, double* fw, double* ww1, const double* dxxdx,
-                            const double* dyydy, const double* dzzdz) {
+    __global__ void k_force_prep(const K q, const double* ro0, const double* tt, double* ro,
+                                double* ww1) {
         long full = (long) q.nx * q.ny * q.nz;
         for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < full;
              t += (long) blockDim.x * gridDim.x) {
@@ -84,6 +83,10 @@ namespace r3d {
             ww1[t]   = v * tt[t];
             ro[t]    = 1.0 / v;
         }
+    }
+    __global__ void k_force(const K q, double grav, const double* ro0, double* fu, double* fv,
+                            double* fw, const double* ww1, const double* dxxdx, const double* dyydy,
+                            const double* dzzdz) {
         long n = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
         for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < n;
              t += (long) blockDim.x * gridDim.x) {
@@ -291,8 +294,10 @@ namespace r3d {
         }
     }
     // WW1=dU/dy, WW2=dV/dy (interior j)
-    __global__ void k_w1_w2_dy(const K q, const double* uu, const double* vv, double* ww1,
-                               double* ww2, const double* dyydy) {
+    // WW1 = dU/dy (interior).  Split from the WW2 update because the heat-2
+    // term (WW1^2 + 2*WW1*WW2) must use WW2 = dV/dx (still valid) - the
+    // Fortran only recomputes WW2 = dV/dy AFTER that first accumulation.
+    __global__ void k_w1_dy(const K q, const double* uu, double* ww1, const double* dyydy) {
         long n = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
         for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < n;
              t += (long) blockDim.x * gridDim.x) {
@@ -303,13 +308,40 @@ namespace r3d {
             long c = f3(q.nx, q.ny, i, j, k);
             ww1[c] = (uu[f3(q.nx, q.ny, i, j + 1, k)] - uu[f3(q.nx, q.ny, i, j - 1, k)]) * q.hy *
                      dyydy[j];
+        }
+    }
+    // WW2 = dV/dy (interior), computed only after the 2*WW1*WW2 accumulation.
+    __global__ void k_w2_dy(const K q, const double* vv, double* ww2, const double* dyydy) {
+        long n = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
+        for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < n;
+             t += (long) blockDim.x * gridDim.x) {
+            int i  = q.i1 + (int) (t % (q.i2 - q.i1 + 1));
+            long r = t / (q.i2 - q.i1 + 1);
+            int j  = q.j1 + (int) (r % (q.j2 - q.j1 + 1));
+            int k  = q.k1 + (int) (r / (q.j2 - q.j1 + 1));
+            long c = f3(q.nx, q.ny, i, j, k);
             ww2[c] = (vv[f3(q.nx, q.ny, i, j + 1, k)] - vv[f3(q.nx, q.ny, i, j - 1, k)]) * q.hy *
                      dyydy[j];
         }
     }
-    __global__ void k_ft_heat2(const K q, const double* ro, const double* tt, double* ft,
-                               const double* ww1, const double* ww2) {
-        const double tmp   = q.ocv * q.ore;
+    // FT += (WW1^2 + 2*WW1*WW2)*RO*OCV*ORE  (WW1=dU/dy, WW2 = dV/dx).
+    __global__ void k_ft_heat2a(const K q, const double* ro, double* ft, const double* ww1,
+                                const double* ww2) {
+        const double tmp = q.ocv * q.ore;
+        long n           = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
+        for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < n;
+             t += (long) blockDim.x * gridDim.x) {
+            int i  = q.i1 + (int) (t % (q.i2 - q.i1 + 1));
+            long r = t / (q.i2 - q.i1 + 1);
+            int j  = q.j1 + (int) (r % (q.j2 - q.j1 + 1));
+            int k  = q.k1 + (int) (r / (q.j2 - q.j1 + 1));
+            long c = f3(q.nx, q.ny, i, j, k);
+            ft[c] += (ww1[c] * ww1[c] + 2.0 * ww1[c] * ww2[c]) * ro[c] * tmp;
+        }
+    }
+    // FT += C43*WW2^2*RO*OCV*ORE ; FT -= OCV*WW2*TT  (WW2=dV/dy).
+    __global__ void k_ft_heat2b(const K q, const double* ro, const double* tt, double* ft,
+                                const double* ww2) {
         const double tmp43 = q.c43 * q.ocv * q.ore;
         long n             = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
         for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < n;
@@ -319,7 +351,6 @@ namespace r3d {
             int j  = q.j1 + (int) (r % (q.j2 - q.j1 + 1));
             int k  = q.k1 + (int) (r / (q.j2 - q.j1 + 1));
             long c = f3(q.nx, q.ny, i, j, k);
-            ft[c] += (ww1[c] * ww1[c] + 2.0 * ww1[c] * ww2[c]) * ro[c] * tmp;
             ft[c] += ww2[c] * ww2[c] * ro[c] * tmp43;
             ft[c] -= q.ocv * ww2[c] * tt[c];
         }
