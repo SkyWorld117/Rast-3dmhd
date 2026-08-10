@@ -32,6 +32,9 @@
 #               match the host.  Structural flags -rdc=true/--cudart=static/
 #               -x cu/-arch are added by the backend regardless, so overriding
 #               NVCCFLAGS changes numerics/perf but not the build model)
+#   USE_NCCL    0|1  use the device-side NCCL exchange (default 0 = host-staged
+#                    MPI; GPU only).  Empty counts as 0.
+#   NCCL_HOME   NCCL prefix used only when USE_NCCL=1 (default empty)
 #   LDFLAGS     extra linker flags               (default empty)
 #   LDLIBS      extra libraries to link          (default -lm)
 #   DUMPMODE    periodic | final | none          (compile-time gstate policy)
@@ -44,21 +47,42 @@
 #   PREFIX / DESTDIR        install destinations (default ./prefix / empty)
 # ------------------------------------------------------------------------------
 BACKEND   = cpu
+# USE_NCCL selects the GPU halo-exchange backend: unset/0 = the host-staged MPI
+# exchange (reliable on every transport; the bit-exact default), 1 = the
+# device-side NCCL exchange (requires an NCCL; see NCCL_HOME below).  Only makes
+# sense for BACKEND=gpu (validated below).  Defined before OBJDIR because the
+# per-config object dirs key off it.
+USE_NCCL ?=
+NCCL_HOME ?=
+# Normalize USE_NCCL to "1" (NCCL) or empty (MPI) so the rest of the makefile
+# only tests one form; "0" and unset both mean MPI.
+ifneq ($(strip $(USE_NCCL)),)
+  ifeq ($(USE_NCCL),0)
+    USE_NCCL :=
+  else ifneq ($(USE_NCCL),1)
+    $(error USE_NCCL must be empty, 0 or 1)
+  endif
+endif
 BUILD    ?= build
 BINDIR    = bin
-# Objects (and the archive) are segregated per backend: switching BACKEND
-# without 'make clean' must never reuse stale objects from the other backend
-# (a stale CPU-built main.o carries the "--backend gpu" guard and once leaked
-# into a GPU build, tripping it at runtime).
-OBJDIR   := $(BUILD)/obj-$(BACKEND)
-LIBDIR   := $(BUILD)/lib-$(BACKEND)
+# Objects (and the archive) are segregated per backend AND halo backend
+# (USE_NCCL): switching either without 'make clean' must never reuse stale
+# objects from the other configuration (a stale CPU-built main.o carries the
+# "--backend gpu" guard and once leaked into a GPU build, tripping it at
+# runtime; a stale MPI-built gpu.o would silently keep the MPI path instead of
+# the NCCL one).
+OBJDIR   := $(BUILD)/obj-$(BACKEND)-$(if $(USE_NCCL),nccl,mpi)
+LIBDIR   := $(BUILD)/lib-$(BACKEND)-$(if $(USE_NCCL),nccl,mpi)
+
 
 PREFIX   ?= $(CURDIR)/prefix
 DESTDIR  ?=
 
 # --- toolchain (all overridable) ---------------------------------------------
 CXX        = mpicxx
-NVCC       = $(or $(CUDA_HOME)/bin/nvcc,/usr/local/cuda/bin/nvcc)
+# $(or $(CUDA_HOME)/bin/nvcc, ...) would expand the unset CUDA_HOME to "/bin/nvcc"
+# (empty + "/bin/nvcc" is non-empty), so use an explicit if.
+NVCC       = $(if $(CUDA_HOME),$(CUDA_HOME)/bin/nvcc,/usr/local/cuda/bin/nvcc)
 NVCC_ARCH  = sm_90
 
 # -ffp-contract=off is the host side of the bit-exact contract (mirrors the
@@ -116,6 +140,9 @@ LIB_OBJS := $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
 GPU_OBJS := $(patsubst src/%.cu,$(OBJDIR)/%.o,$(GPU_SRCS))
 
 ifeq ($(BACKEND),cpu)
+  ifneq ($(USE_NCCL),)
+    $(error USE_NCCL requires BACKEND=gpu)
+  endif
   LIB_SRCS := $(filter-out src/gpu.cpp,$(LIB_SRCS))
   LIB_OBJS := $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
   GPU_OBJS :=
@@ -129,12 +156,26 @@ else ifeq ($(BACKEND),gpu)
   MPI_CFLAGS ?= $(shell $(CXX) --showme:compile 2>/dev/null)
   MPI_LIBS   ?= $(shell $(CXX) --showme:link 2>/dev/null)
   NVCC_MPI_LIBS := $(shell echo '$(MPI_LIBS)' | sed 's/-Wl,\([^ ]*\)/-Xlinker \1/g')
+  # USE_NCCL=1 adds the NCCL backend: a compile-time define plus NCCL include/lib
+  # flags (an explicit-but-empty NCCL_HOME means "find NCCL on the default search
+  # path"; NCCL_INC/NCCL_LIBS stay overridable).  The MPI exchange is the default.
+  ifeq ($(USE_NCCL),1)
+    COMM_FLAG := -DR3D_COMM_NCCL
+    ifeq ($(strip $(NCCL_HOME)),)
+      NCCL_INC  ?=
+      NCCL_LIBS ?= -lnccl
+    else
+      NCCL_INC  ?= -I$(NCCL_HOME)/include
+      # nvcc drives the link, so rpath uses the -Xlinker form (like NVCC_MPI_LIBS).
+      NCCL_LIBS ?= -L$(NCCL_HOME)/lib -Xlinker -rpath -Xlinker $(NCCL_HOME)/lib -lnccl
+    endif
+  endif
   CC       := $(NVCC)
   COMPILE  := $(CC) $(NVCCFLAGS) -x cu -rdc=true --cudart=static \
-              -arch=$(NVCC_ARCH) $(MPI_CFLAGS) -DR3D_HAVE_GPU -MMD -MP \
-              -Iinclude $(DUMP_FLAG)
+              -arch=$(NVCC_ARCH) $(MPI_CFLAGS) -DR3D_HAVE_GPU $(COMM_FLAG) $(NCCL_INC) \
+              -MMD -MP -Iinclude $(DUMP_FLAG)
   LINK     := $(CC) $(NVCCFLAGS) $(LDFLAGS) -rdc=true --cudart=static \
-              -arch=$(NVCC_ARCH) $(NVCC_MPI_LIBS) -lcudart
+              -arch=$(NVCC_ARCH) $(NVCC_MPI_LIBS) -lcudart $(NCCL_LIBS)
   LINK_OBJS := $(LIB_OBJS) $(GPU_OBJS)
 
 else

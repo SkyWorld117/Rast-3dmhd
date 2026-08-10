@@ -43,9 +43,17 @@ MPIRUN=/scratch/zyi/.kez/env/mpis/openmpi-5.0.10-system/openmpi/bin/mpirun
 NPEZ=$((NP / NPEY))
 [ -x "$BIN" ]    || { echo "error: binary not executable: $BIN (build with: make BACKEND=gpu)"; exit 1; }
 # A CPU-only build would abort mid-job on --backend gpu; fail fast instead.
-# (nm reports the C++ mangled name "...step_gpu...", so match the bare symbol.)
-nm "$BIN" 2>/dev/null | grep -q 'step_gpu' \
+# Grep the (not-stripped) ELF directly for the mangled step_gpu symbol: a pipe
+# (nm | grep -q) is racy under 'set -o pipefail' - grep -q exits on the first
+# match, SIGPIPEs nm while it is still writing, and the pipeline then reports
+# 141 as a failure even though the binary is a valid GPU build.  A raw-file
+# grep is also independent of binutils being installed on the node.
+grep -aq 'step_gpu' "$BIN" \
     || { echo "error: $BIN is not a GPU build (rebuild with: make BACKEND=gpu)"; exit 1; }
+# Guard against the historical mixed build: a stale CPU main.o (with the
+# "--backend gpu ... without CUDA" guard) linked against fresh GPU objects.
+grep -aq 'without CUDA' "$BIN" \
+    && { echo "error: $BIN is a mixed CPU-main/GPU-object build (make clean + make BACKEND=gpu)"; exit 1; }
 [ $((NP % NPEY)) -eq 0 ]   || { echo "error: npey $NPEY does not divide NP $NP"; exit 1; }
 [ $((NPY % NPEY)) -eq 0 ]  || { echo "error: npy $NPY not divisible by npey $NPEY"; exit 1; }
 [ "$NPEZ" -ge 2 ]          || { echo "error: npez $NPEZ must be >= 2"; exit 1; }

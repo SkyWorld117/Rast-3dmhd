@@ -569,6 +569,70 @@ namespace r3d {
             ww3[c]    = 0.375 * dd * dd * q.re * ro[c];
         }
     }
+    // Two-stage interior-min reduction of WW1..3 for the NCCL dt AllReduce.  min
+    // over a set is exact and order-independent, so the result equals the host
+    // scan of the MPI path bit-for-bit.  Stage 1: per-block partials; stage 2
+    // (k_dt_final, single block) reduces them to out[0..2].
+    __global__ void k_dt_min3(const K q, const double* w1, const double* w2, const double* w3,
+                              double* partial) {
+        long n   = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
+        double a = 1e300, b = 1e300, c = 1e300;
+        for (long t = blockIdx.x * (long) blockDim.x + threadIdx.x; t < n;
+             t += (long) blockDim.x * gridDim.x) {
+            int i    = q.i1 + (int) (t % (q.i2 - q.i1 + 1));
+            long r   = t / (q.i2 - q.i1 + 1);
+            int j    = q.j1 + (int) (r % (q.j2 - q.j1 + 1));
+            int k    = q.k1 + (int) (r / (q.j2 - q.j1 + 1));
+            long cid = f3(q.nx, q.ny, i, j, k);
+            a        = fmin(a, w1[cid]);
+            b        = fmin(b, w2[cid]);
+            c        = fmin(c, w3[cid]);
+        }
+        __shared__ double sa[1024], sb[1024], sc[1024];
+        sa[threadIdx.x] = a;
+        sb[threadIdx.x] = b;
+        sc[threadIdx.x] = c;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                sa[threadIdx.x] = fmin(sa[threadIdx.x], sa[threadIdx.x + s]);
+                sb[threadIdx.x] = fmin(sb[threadIdx.x], sb[threadIdx.x + s]);
+                sc[threadIdx.x] = fmin(sc[threadIdx.x], sc[threadIdx.x + s]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            partial[3 * blockIdx.x]     = sa[0];
+            partial[3 * blockIdx.x + 1] = sb[0];
+            partial[3 * blockIdx.x + 2] = sc[0];
+        }
+    }
+    __global__ void k_dt_final(double* out, const double* partial, int nparts) {
+        double a = 1e300, b = 1e300, c = 1e300;
+        for (int i = threadIdx.x; i < nparts; i += blockDim.x) {
+            a = fmin(a, partial[3 * i]);
+            b = fmin(b, partial[3 * i + 1]);
+            c = fmin(c, partial[3 * i + 2]);
+        }
+        __shared__ double sa[1024], sb[1024], sc[1024];
+        sa[threadIdx.x] = a;
+        sb[threadIdx.x] = b;
+        sc[threadIdx.x] = c;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                sa[threadIdx.x] = fmin(sa[threadIdx.x], sa[threadIdx.x + s]);
+                sb[threadIdx.x] = fmin(sb[threadIdx.x], sb[threadIdx.x + s]);
+                sc[threadIdx.x] = fmin(sc[threadIdx.x], sc[threadIdx.x + s]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            out[0] = sa[0];
+            out[1] = sb[0];
+            out[2] = sc[0];
+        }
+    }
     // Copy Z* = physical state (6 primaries; interior).
     __global__ void k_save_state(const K q, const double* ru, const double* rv, const double* rw,
                                  const double* ro, const double* tt, double* zru, double* zrv,

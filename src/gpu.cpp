@@ -11,6 +11,10 @@
 #include <cuda_runtime.h>
 #include <mpi.h>
 
+#ifdef R3D_COMM_NCCL
+#include <nccl.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -84,6 +88,8 @@ namespace r3d {
                               const double*, double*);
     __global__ void k_step_dt(const K, const double*, const double*, const double*, const double*,
                               const double*, const double*, double*, double*, double*);
+    __global__ void k_dt_min3(const K, const double*, const double*, const double*, double*);
+    __global__ void k_dt_final(double*, const double*, int);
     __global__ void k_save_state(const K, const double*, const double*, const double*,
                                  const double*, const double*, double*, double*, double*, double*,
                                  double*);
@@ -119,6 +125,19 @@ namespace r3d {
         }                                                                                  \
     } while (0)
 
+#ifdef R3D_COMM_NCCL
+#define NCCL_CHECK(x)                                                                      \
+    do {                                                                                   \
+        ncclResult_t e = (x);                                                              \
+        if (e != ncclSuccess) {                                                            \
+            fprintf(stderr, "rast-3dmhd: NCCL error %s at %s:%d\n", ncclGetErrorString(e), \
+                    __FILE__, __LINE__);                                                   \
+            fflush(stderr);                                                                \
+            exit(EXIT_FAILURE);                                                            \
+        }                                                                                  \
+    } while (0)
+#endif
+
         constexpr int kThreads = 256;
 
         long ceil_div(long n, int t) { return (n + t - 1) / t; }
@@ -128,6 +147,35 @@ namespace r3d {
         }
         void zero(double* p, long n) { CUDA_CHECK(cudaGetLastError()); }
         void check() { CUDA_CHECK(cudaGetLastError()); }
+
+#ifdef R3D_COMM_NCCL
+        // One NCCL communicator over the (single) MPI communicator.  Created
+        // lazily on the first step_gpu call - all ranks reach it in lockstep,
+        // which the collective unique-id broadcast needs - and destroyed from
+        // gpu_free() so the tests can re-init cleanly between cases.
+        ncclComm_t g_nccl_comm = nullptr;
+        bool g_nccl_ready      = false;
+
+        void nccl_ensure(MPI_Comm comm) {
+            if (g_nccl_ready) return;
+            int npe, mype;
+            MPI_Comm_size(comm, &npe);
+            MPI_Comm_rank(comm, &mype);
+            ncclUniqueId id;
+            if (mype == 0) NCCL_CHECK(ncclGetUniqueId(&id));
+            MPI_Bcast(&id, (int) sizeof(id), MPI_BYTE, 0, comm);
+            NCCL_CHECK(ncclCommInitRank(&g_nccl_comm, npe, id, mype));
+            g_nccl_ready = true;
+        }
+
+        void nccl_teardown() {
+            if (g_nccl_ready) {
+                NCCL_CHECK(ncclCommDestroy(g_nccl_comm));
+                g_nccl_comm  = nullptr;
+                g_nccl_ready = false;
+            }
+        }
+#endif
 
     }  // namespace
 
@@ -232,6 +280,9 @@ namespace r3d {
         FREE(g.dkapa);
         FREE(g.rho0);
 #undef FREE
+#ifdef R3D_COMM_NCCL
+        nccl_teardown();
+#endif
     }
 
     static void cp(double* dst, const double* src, long n) {
@@ -521,10 +572,172 @@ namespace r3d {
     }  // namespace
 
     // ---------------------------------------------------------------------------
+    // NCCL device-side communication (compiled only with -DR3D_COMM_NCCL).
+    //
+    // The halo exchange and the per-step dt reduction run entirely on the
+    // device: strided y/z slabs are packed once into device staging buffers and
+    // moved straight to the neighbour's GPU (no pinned-host bounce, no
+    // transport-dependent CUDA-aware MPI memory-ordering hazards).  NCCL
+    // operations are issued on the default stream, so they are ordered with the
+    // pack/unpack kernels by construction and (being GPU-blocking) complete
+    // before the next same-stream kernel runs - staging buffers are safe to
+    // reuse across fields without an explicit sync.
+    // ---------------------------------------------------------------------------
+#ifdef R3D_COMM_NCCL
+    namespace {
+
+        // Device halo exchange for one field.  Equivalent to comm_field_gpu()
+        // above but with device-side NCCL collectives instead of the host-staged
+        // MPI bounce.  Each axis is one ncclAllGather: every rank contributes its
+        // interior slabs (for z: the send-up and send-down planes; for y: the
+        // packed upper and lower slabs) and then unpacks the two neighbour slabs
+        // it needs from the gathered record.  AllGather uses the ring/tree
+        // collective machinery - unlike NCCL's point-to-point send/recv pipe,
+        // which fails to come up on some clusters/GPUs - so this is the portable
+        // NCCL path.  The values moved are byte-identical to the MPI path's.
+        void comm_field_gpu_nccl(const Params& p, const Topology& t, GpuSim& g, double* f) {
+            const int nx = g.nx, ny = g.ny, nz = g.nz;
+            const int iyh = p.iy / 2, ilaph = p.ilap / 2;
+            const long vcount = (long) nx * ny * ilaph;
+            const long ycount = (long) nx * iyh * nz;
+            const int nranks  = t.npe;
+            cudaStream_t s    = nullptr;  // default stream: ordered with the kernels
+
+            // Vertical (z) halo: one AllGather of the two interior slabs (zslot
+            // = [send-up, send-down]).  Lower ghost comes from the rank below's
+            // send-up slab, upper ghost from the rank above's send-down slab.
+            // npez==1 (or the boundary end of the line) simply has no such
+            // neighbour.  The gather runs over the whole comm - slabs contributed
+            // by ranks in other z-columns are unused, which is harmless.
+            if (t.npez > 1) {
+                const long zslot     = 2 * vcount;
+                static double *zsend = nullptr, *zgather = nullptr;
+                static long zcap = 0;
+                if (zcap < (long) nranks * zslot) {
+                    if (zsend) {
+                        cudaFree(zsend);
+                        cudaFree(zgather);
+                    }
+                    CUDA_CHECK(cudaMalloc((void**) &zsend, (size_t) zslot * sizeof(double)));
+                    CUDA_CHECK(
+                        cudaMalloc((void**) &zgather, (size_t) nranks * zslot * sizeof(double)));
+                    zcap = (long) nranks * zslot;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(zsend, f + (long) (nz - p.ilap) * nx * ny,
+                                           (size_t) vcount * sizeof(double),
+                                           cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(zsend + vcount, f + (long) ilaph * nx * ny,
+                                           (size_t) vcount * sizeof(double),
+                                           cudaMemcpyDeviceToDevice, s));
+                NCCL_CHECK(ncclAllGather(zsend, zgather, zslot, ncclDouble, g_nccl_comm, s));
+                if (t.mypez > 0)  // lower ghost plane from the rank below
+                    CUDA_CHECK(cudaMemcpyAsync(f, zgather + (long) (t.mype - t.npey) * zslot,
+                                               (size_t) vcount * sizeof(double),
+                                               cudaMemcpyDeviceToDevice, s));
+                if (t.mypez < t.npez - 1)  // upper ghost plane from the rank above
+                    CUDA_CHECK(cudaMemcpyAsync(f + (long) (nz - ilaph) * nx * ny,
+                                               zgather + (long) (t.mype + t.npey) * zslot + vcount,
+                                               (size_t) vcount * sizeof(double),
+                                               cudaMemcpyDeviceToDevice, s));
+            }
+
+            // y halo: one AllGather of the two strided slabs, pre-packed into a
+            // device buffer (yslot = [upper, lower]).  The low ghost is the rank
+            // below's upper slab, the high ghost the rank above's lower slab;
+            // neighbours are the cyclic (mypey +/- 1) columns, which for npey==1
+            // means this rank wraps onto itself (the MPI path's local branch).
+            // The per-rank record lives at the *rank* slot (rank = mypey + mypez
+            // * npey), so neighbours are addressed by rank, not mypey.
+            {
+                const long yslot     = 2 * ycount;
+                static double *ysend = nullptr, *ygather = nullptr;
+                static long ycap = 0;
+                if (ycap < (long) nranks * yslot) {
+                    if (ysend) {
+                        cudaFree(ysend);
+                        cudaFree(ygather);
+                    }
+                    CUDA_CHECK(cudaMalloc((void**) &ysend, (size_t) yslot * sizeof(double)));
+                    CUDA_CHECK(
+                        cudaMalloc((void**) &ygather, (size_t) nranks * yslot * sizeof(double)));
+                    ycap = (long) nranks * yslot;
+                }
+                const int rDn = t.mype - t.mypey + (t.mypey + t.npey - 1) % t.npey;
+                const int rUp = t.mype - t.mypey + (t.mypey + 1) % t.npey;
+                k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend, f, nx, ny, ny - p.iy, iyh,
+                                                                   nz);
+                k_pack_y<<<ceil_div(ycount, kThreads), kThreads>>>(ysend + ycount, f, nx, ny, iyh,
+                                                                   iyh, nz);
+                check();
+                NCCL_CHECK(ncclAllGather(ysend, ygather, yslot, ncclDouble, g_nccl_comm, s));
+                k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(
+                    f, ygather + (long) rDn * yslot, nx, ny, 0, iyh, nz);
+                k_unpack_y<<<ceil_div(ycount, kThreads), kThreads>>>(
+                    f, ygather + (long) rUp * yslot + ycount, nx, ny, ny - iyh, iyh, nz);
+                check();
+            }
+
+            // x halo: x is never decomposed, so this is a purely local periodic
+            // wrap through a single device staging buffer (unchanged from the MPI
+            // path).
+            const long xcount   = (long) (p.ix / 2) * ny * nz;
+            static double* xbuf = nullptr;
+            static long xcap    = 0;
+            if (xcap < xcount) {
+                if (xbuf) cudaFree(xbuf);
+                CUDA_CHECK(cudaMalloc((void**) &xbuf, (size_t) xcount * sizeof(double)));
+                xcap = xcount;
+            }
+            k_pack_x<<<ceil_div(xcount, kThreads), kThreads>>>(xbuf, f, nx, ny, nx - p.ix, p.ix / 2,
+                                                               nz);
+            check();
+            k_unpack_x<<<ceil_div(xcount, kThreads), kThreads>>>(f, xbuf, nx, ny, 0, p.ix / 2, nz);
+            check();
+            k_pack_x<<<ceil_div(xcount, kThreads), kThreads>>>(xbuf, f, nx, ny, p.ix / 2, p.ix / 2,
+                                                               nz);
+            check();
+            k_unpack_x<<<ceil_div(xcount, kThreads), kThreads>>>(f, xbuf, nx, ny, nx - p.ix / 2,
+                                                                 p.ix / 2, nz);
+            check();
+        }
+
+        // Per-step timestep: interior min of WW1..3 on the device, then one NCCL
+        // AllReduce (min) over the ranks.  Keeps the whole reduction on the GPU -
+        // the MPI path's three full-array D2H copies per step are gone.
+        void step_dt_gpu_nccl(const Params& p, const K& q, GpuSim& g, double& dt) {
+            const long interior = (long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1);
+            const int nblocks   = (int) ceil_div(interior, kThreads);
+            static double* partial = nullptr;
+            static long pcap       = 0;
+            if (pcap < 3 * (long) nblocks) {
+                if (partial) cudaFree(partial);
+                CUDA_CHECK(cudaMalloc((void**) &partial, 3 * (size_t) nblocks * sizeof(double)));
+                pcap = 3 * (long) nblocks;
+            }
+            static double* out = nullptr;
+            if (!out) CUDA_CHECK(cudaMalloc((void**) &out, 3 * sizeof(double)));
+            cudaStream_t s = nullptr;
+            k_dt_min3<<<nblocks, kThreads>>>(q, g.ww1, g.ww2, g.ww3, partial);
+            check();
+            k_dt_final<<<1, kThreads>>>(out, partial, nblocks);
+            check();
+            NCCL_CHECK(ncclAllReduce(out, out, 3, ncclDouble, ncclMin, g_nccl_comm, s));
+            static double hout[3];
+            CUDA_CHECK(cudaMemcpy(hout, out, 3 * sizeof(double), cudaMemcpyDeviceToHost));
+            dt = p.sf * std::min(std::min(hout[0], hout[1]), hout[2]);
+        }
+
+    }  // namespace
+#endif
+
+    // ---------------------------------------------------------------------------
     // step_gpu
     // ---------------------------------------------------------------------------
     void step_gpu(int nstages, MPI_Comm comm, const Params& p, const Derived& d, const Topology& t,
                   GpuSim& g, SimState& sc) {
+#ifdef R3D_COMM_NCCL
+        nccl_ensure(comm);
+#endif
         K q;
         q.nx    = g.nx;
         q.ny    = g.ny;
@@ -561,6 +774,16 @@ namespace r3d {
         q.lk    = p.ix / 2;
 
         const long n = (long) g.nx * g.ny * g.nz;
+#ifdef R3D_COMM_NCCL
+        // NCCL path: the whole dt reduction stays on the device - k_step_dt fills
+        // WW1..3, a device interior-min folds them, and one NCCL AllReduce joins
+        // the ranks (no host round-trip, no per-step D2H of the temporaries).
+        k_step_dt<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
+                             kThreads),
+                    kThreads>>>(q, g.ro, g.uu, g.rkapa, g.ddx, g.ddy, g.ddz, g.ww1, g.ww2, g.ww3);
+        check();
+        step_dt_gpu_nccl(p, q, g, sc.dt);
+#else
         // For correctness and simplicity the few per-step reduction scalars are
         // computed on the host from a device -> host copy of the temporary arrays.
         // (They are single doubles; FLUXES stays fully on the device.)
@@ -598,6 +821,7 @@ namespace r3d {
         double wout[4];
         MPI_Allreduce(wmin, wout, 3, MPI_DOUBLE, MPI_MIN, comm);
         sc.dt = p.sf * std::min(std::min(wout[0], wout[1]), wout[2]);
+#endif
 
         // ---- 3-stage low-storage Wray RK3 on the device ----------------------
         k_save_state<<<ceil_div((long) (q.i2 - q.i1 + 1) * (q.j2 - q.j1 + 1) * (q.k2 - q.k1 + 1),
@@ -775,6 +999,18 @@ namespace r3d {
             check();
         };
         auto comm_gpu = [&]() {
+#ifdef R3D_COMM_NCCL
+            comm_field_gpu_nccl(p, t, g, g.ru);
+            comm_field_gpu_nccl(p, t, g, g.rv);
+            comm_field_gpu_nccl(p, t, g, g.rw);
+            comm_field_gpu_nccl(p, t, g, g.tt);
+            comm_field_gpu_nccl(p, t, g, g.ro);
+            if (p.lmag) {
+                comm_field_gpu_nccl(p, t, g, g.bx);
+                comm_field_gpu_nccl(p, t, g, g.by);
+                comm_field_gpu_nccl(p, t, g, g.bz);
+            }
+#else
             comm_field_gpu(comm, p, t, g, g.ru);
             comm_field_gpu(comm, p, t, g, g.rv);
             comm_field_gpu(comm, p, t, g, g.rw);
@@ -785,6 +1021,7 @@ namespace r3d {
                 comm_field_gpu(comm, p, t, g, g.by);
                 comm_field_gpu(comm, p, t, g, g.bz);
             }
+#endif
         };
 
         for (int st = 0; st < nstages; ++st) {

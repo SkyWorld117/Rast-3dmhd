@@ -6,6 +6,10 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#endif
+
 #include <string>
 #include <vector>
 
@@ -29,6 +33,17 @@ TEST(Gpu, EquivalenceWithCpu) {
     Params p   = golden_params();
     Topology t = resolve_topology(npes, rank, p);
     Derived d  = derive(p, npes, t.npey, t.npez);
+
+    // Give each rank its own device so the NCCL backend can build a
+    // communicator; under a per-rank CUDA_VISIBLE_DEVICES (e.g. slurm
+    // --gpus-per-task) every rank still lands on device 0, which is the right
+    // one.  Harmless for the host-staged MPI backend, which runs on whatever
+    // device is current.
+#ifdef __CUDACC__
+    int ndev = 0;
+    cudaGetDeviceCount(&ndev);
+    if (ndev > 1) cudaSetDevice(rank % ndev);
+#endif
 
     auto build_init = [&](SimState& s) {
         std::vector<double> T(p.npz), R(p.npz);
@@ -169,6 +184,13 @@ TEST(Gpu, StageByStageVsGolden) {
     Topology t      = resolve_topology(npes, rank, p);
     Derived d       = derive(p, npes, t.npey, t.npez);
     std::string tag = "00" + std::to_string(rank);
+#ifdef __CUDACC__
+    {
+        int ndev = 0;
+        cudaGetDeviceCount(&ndev);
+        if (ndev > 1) cudaSetDevice(rank % ndev);
+    }
+#endif
     for (int st = 1; st <= 3; ++st) {
         SimState s(d);
         std::vector<double> T(p.npz), R(p.npz);
